@@ -1,0 +1,695 @@
+import { describe, expect, it } from 'vitest'
+import { createGoogleProvider } from '../../src/adapters/google/provider.js'
+import {
+  createEnvOAuthCredentials,
+  isApiNotEnabled,
+  needsReconnect,
+  needsSetup,
+  type CalendarSetupRequiredError,
+} from '../../src/adapters/oauth.js'
+import { computeSlots } from '../../src/core/slots/engine.js'
+import { combineBusy } from '../../src/core/domain/booking-service.js'
+import { localTimeToInstant } from '../../src/core/time/zone.js'
+import type { CalendarConnection, EventType, WeeklySchedule } from '../../src/core/domain/types.js'
+import type { OAuthTokens } from '../../src/core/domain/types.js'
+
+/**
+ * The Google path end to end, against a scripted Google.
+ *
+ * The existing suite covers the PARSERS in isolation. This covers the wiring
+ * that sits between them and is where integrations actually break: the request
+ * we send, the token refresh we perform first, what the parsed busy time does
+ * to the slot list, and how a revoked grant surfaces.
+ *
+ * It cannot prove Google's real responses match these fixtures — only a live
+ * connection does that. The fixtures are taken from Google's
+ * documented response shapes, and the parsers already accept both variants the
+ * docs disagree on.
+ */
+
+const HOUR = 3_600_000
+const DAY = 86_400_000
+const TZ = 'Europe/Kyiv'
+
+interface Call {
+  url: string
+  method: string
+  body: unknown
+  headers: Record<string, string>
+}
+
+/** A scripted Google. Records what we sent, replies with what Google would. */
+function scriptGoogle(routes: Array<[RegExp, (body: unknown) => { status?: number; json: unknown }]>) {
+  const calls: Call[] = []
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString()
+    const method = init?.method ?? 'GET'
+    let body: unknown = undefined
+    if (typeof init?.body === 'string') {
+      try {
+        body = JSON.parse(init.body)
+      } catch {
+        body = Object.fromEntries(new URLSearchParams(init.body))
+      }
+    }
+    calls.push({ url, method, body, headers: (init?.headers ?? {}) as Record<string, string> })
+
+    for (const [pattern, handler] of routes) {
+      if (pattern.test(url)) {
+        const { status = 200, json } = handler(body)
+        return new Response(JSON.stringify(json), {
+          status,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+    }
+    return new Response(JSON.stringify({ error: 'no route', url }), { status: 501 })
+  }) as typeof globalThis.fetch
+
+  return { fetchImpl, calls }
+}
+
+const VALID_TOKENS: OAuthTokens = {
+  accessToken: 'ya29.valid',
+  refreshToken: '1//refresh',
+  expiresAt: Date.now() + HOUR,
+  scope: 'https://www.googleapis.com/auth/calendar.events',
+}
+
+function connection(over: Partial<CalendarConnection> = {}): CalendarConnection {
+  return {
+    id: 'conn_1',
+    userId: 'u1',
+    provider: 'google',
+    providerAccountEmail: 'serge@example.com',
+    encryptedTokens: 'unused-in-these-tests',
+    keyVersion: 1,
+    calendarIdsRead: ['primary'],
+    calendarIdWrite: 'primary',
+    syncStatus: 'ok',
+    createdAt: 0,
+    ...over,
+  }
+}
+
+/** Deps with the token layer stubbed: these tests are about the wiring above it. */
+function deps(
+  fetchImpl: typeof globalThis.fetch,
+  tokens: OAuthTokens = VALID_TOKENS,
+  onRefresh: (id: string, t: OAuthTokens) => Promise<void> = async () => {},
+) {
+  return {
+    oauth: createEnvOAuthCredentials(
+      { GOOGLE_CLIENT_ID: 'cid', GOOGLE_CLIENT_SECRET: 'csec' },
+      'https://calendar.example',
+    ),
+    crypto: {
+      decrypt: async () => JSON.stringify(tokens),
+      randomToken: (n = 16) => 'r'.repeat(n),
+    },
+    clock: { now: () => Date.now() },
+    // No real waiting: the conference poll is bounded by attempts, not by
+    // elapsed time, so a test can drive every attempt instantly.
+    sleep: async () => {},
+    onTokensRefreshed: onRefresh,
+    fetch: fetchImpl,
+  }
+}
+
+describe('Google freeBusy → busy intervals', () => {
+  it('sends the range Google expects and parses the reply', async () => {
+    const start = localTimeToInstant('2026-06-15', 0, TZ)
+    const end = start + DAY
+    const busyStart = localTimeToInstant('2026-06-15', 10 * 60, TZ)
+
+    const { fetchImpl, calls } = scriptGoogle([
+      [
+        /freeBusy/,
+        () => ({
+          json: {
+            kind: 'calendar#freeBusy',
+            calendars: {
+              primary: {
+                busy: [
+                  {
+                    start: new Date(busyStart).toISOString(),
+                    end: new Date(busyStart + HOUR).toISOString(),
+                  },
+                ],
+              },
+            },
+          },
+        }),
+      ],
+    ])
+
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const busy = await provider.getBusy(connection(), { start, end })
+
+    // The request carried the window and the calendar we asked about.
+    expect(calls).toHaveLength(1)
+    const sent = calls[0]!.body as { timeMin: string; timeMax: string; items: Array<{ id: string }> }
+    expect(new Date(sent.timeMin).getTime()).toBe(start)
+    expect(new Date(sent.timeMax).getTime()).toBe(end)
+    expect(sent.items).toEqual([{ id: 'primary' }])
+
+    // And the reply became exactly one busy interval, unbuffered.
+    expect(busy).toEqual([{ start: busyStart, end: busyStart + HOUR }])
+  })
+
+  it('an empty calendar yields no busy time rather than throwing', async () => {
+    const { fetchImpl } = scriptGoogle([
+      [/freeBusy/, () => ({ json: { calendars: { primary: { busy: [] } } } })],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const start = localTimeToInstant('2026-06-15', 0, TZ)
+    expect(await provider.getBusy(connection(), { start, end: start + DAY })).toEqual([])
+  })
+
+  it('a per-calendar error is NOT silently treated as free', async () => {
+    // Google reports per-calendar failures inside a 200. Treating that as "no
+    // busy time" is the shortest path to a double booking.
+    const { fetchImpl } = scriptGoogle([
+      [
+        /freeBusy/,
+        () => ({
+          json: {
+            calendars: {
+              primary: { errors: [{ domain: 'global', reason: 'notFound' }], busy: [] },
+            },
+          },
+        }),
+      ],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const start = localTimeToInstant('2026-06-15', 0, TZ)
+    await expect(provider.getBusy(connection(), { start, end: start + DAY })).rejects.toThrow()
+  })
+})
+
+describe('busy time actually removes slots', () => {
+  it('a Google event takes its slots out of the booking page', async () => {
+    const start = localTimeToInstant('2026-06-15', 0, TZ)
+    const dayEnd = localTimeToInstant('2026-06-16', 0, TZ)
+    const meeting = localTimeToInstant('2026-06-15', 10 * 60, TZ)
+
+    const { fetchImpl } = scriptGoogle([
+      [
+        /freeBusy/,
+        () => ({
+          json: {
+            calendars: {
+              primary: {
+                busy: [
+                  {
+                    start: new Date(meeting).toISOString(),
+                    end: new Date(meeting + HOUR).toISOString(),
+                  },
+                ],
+              },
+            },
+          },
+        }),
+      ],
+    ])
+
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const external = await provider.getBusy(connection(), { start, end: dayEnd })
+
+    const weekly = [
+      [],
+      [{ startMinute: 540, endMinute: 1020 }],
+      [{ startMinute: 540, endMinute: 1020 }],
+      [{ startMinute: 540, endMinute: 1020 }],
+      [{ startMinute: 540, endMinute: 1020 }],
+      [{ startMinute: 540, endMinute: 1020 }],
+      [],
+    ] as WeeklySchedule
+
+    const et: EventType = {
+      id: 'et1', ownerUserId: 'u1', ownerTeamId: null, schedulingType: 'personal',
+      slug: '30min', title: '30 min', description: '', durationMinutes: 30,
+      slotIntervalMinutes: null, bufferBeforeMinutes: 0, bufferAfterMinutes: 0,
+      minNoticeMinutes: 0, maxHorizonDays: 365, maxPerDay: null,
+      locationType: 'google_meet', locationValue: null, questions: [],
+      active: true, createdAt: 0, scheduleId: null,
+    }
+
+    const hosts = [
+      {
+        hostUserId: 'u1',
+        availability: { userId: 'u1', timezone: TZ, weekly, overrides: [] },
+        busy: combineBusy([], [], external),
+      },
+    ]
+
+    const withBusy = computeSlots({ eventType: et, hosts, range: { start, end: dayEnd }, now: start - DAY })
+    const withoutBusy = computeSlots({
+      eventType: et,
+      hosts: [{ ...hosts[0]!, busy: [] }],
+      range: { start, end: dayEnd },
+      now: start - DAY,
+    })
+
+    // Monday 09:00-17:00 is 16 slots; the Google meeting removes two.
+    expect(withoutBusy).toHaveLength(16)
+    expect(withBusy).toHaveLength(14)
+    expect(withBusy.some((s) => s.start >= meeting && s.start < meeting + HOUR)).toBe(false)
+  })
+})
+
+describe('creating the event on the host calendar', () => {
+  it('posts the meeting and requests a Meet link', async () => {
+    const { fetchImpl, calls } = scriptGoogle([
+      [/events\?|events$/, () => ({ json: { id: 'evt_123', hangoutLink: 'https://meet.google.com/abc' } })],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const start = localTimeToInstant('2026-06-15', 10 * 60, TZ)
+
+    const created = await provider.createEvent(connection(), {
+      title: '30 min intro',
+      description: 'Booked via Cadence',
+      start,
+      end: start + 30 * 60_000,
+      attendees: [{ email: 'guest@example.com', name: 'Guest' }],
+      timezone: TZ,
+      createConference: true,
+    })
+
+    expect(created.id).toBe('evt_123')
+    // The link Google minted, captured rather than discarded. This
+    // fixture always returned `hangoutLink`; until now the adapter read only
+    // the id and threw it away, which is why guests were told the link was
+    // "in the calendar invite" when nothing anywhere held it.
+    expect(created.conferenceUrl).toBe('https://meet.google.com/abc')
+    const call = calls[0]!
+    // conferenceDataVersion=1 is REQUIRED or Google silently drops the Meet
+    // link, which is the whole point of the location type.
+    expect(call.url).toContain('conferenceDataVersion=1')
+    const body = call.body as {
+      summary: string
+      start: { dateTime: string }
+      attendees: Array<{ email: string }>
+      conferenceData?: { createRequest?: { requestId?: string } }
+    }
+    expect(body.summary).toBe('30 min intro')
+    expect(new Date(body.start.dateTime).getTime()).toBe(start)
+    expect(body.attendees.map((a) => a.email)).toContain('guest@example.com')
+    expect(body.conferenceData?.createRequest?.requestId).toBeTruthy()
+  })
+
+  it('does not request a conference when the event type does not want one', async () => {
+    const { fetchImpl, calls } = scriptGoogle([[/events/, () => ({ json: { id: 'evt_2' } })]])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const start = localTimeToInstant('2026-06-15', 10 * 60, TZ)
+    await provider.createEvent(connection(), {
+      title: 'Phone call',
+      description: '',
+      start,
+      end: start + 30 * 60_000,
+      attendees: [{ email: 'g@example.com' }],
+      timezone: TZ,
+      createConference: false,
+    })
+    const body = calls[0]!.body as { conferenceData?: unknown }
+    expect(body.conferenceData).toBeUndefined()
+  })
+})
+
+describe('token lifecycle', () => {
+  it('refreshes an expired access token before calling, and persists the result', async () => {
+    const expired: OAuthTokens = { ...VALID_TOKENS, accessToken: 'ya29.stale', expiresAt: Date.now() - HOUR }
+    const persisted: OAuthTokens[] = []
+
+    const { fetchImpl, calls } = scriptGoogle([
+      [/oauth2.*token|token$/, () => ({ json: { access_token: 'ya29.fresh', expires_in: 3600 } })],
+      [/freeBusy/, () => ({ json: { calendars: { primary: { busy: [] } } } })],
+    ])
+
+    const provider = createGoogleProvider(
+      deps(fetchImpl, expired, async (_id: string, t: OAuthTokens) => {
+        persisted.push(t)
+      }) as never,
+    )
+    const start = localTimeToInstant('2026-06-15', 0, TZ)
+    await provider.getBusy(connection(), { start, end: start + DAY })
+
+    // Refresh first, then the actual call — and with the NEW token.
+    expect(calls[0]!.url).toMatch(/token/)
+    expect(calls[1]!.url).toMatch(/freeBusy/)
+    expect(JSON.stringify(calls[1]!.headers)).toContain('ya29.fresh')
+
+    // Persisted before use: Google does not return a new refresh token, so the
+    // old one must be carried forward rather than dropped.
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]!.accessToken).toBe('ya29.fresh')
+    expect(persisted[0]!.refreshToken).toBe('1//refresh')
+  })
+
+  it('a revoked grant surfaces as needs-reconnect, not a generic failure', async () => {
+    const expired: OAuthTokens = { ...VALID_TOKENS, expiresAt: Date.now() - HOUR }
+    const { fetchImpl } = scriptGoogle([
+      [/token/, () => ({ status: 400, json: { error: 'invalid_grant' } })],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl, expired) as never)
+    const start = localTimeToInstant('2026-06-15', 0, TZ)
+
+    // The caller distinguishes this to set sync_status='needs_reconnect' and
+    // prompt the host, rather than failing bookings silently (ADR-0005 §6).
+    await expect(provider.getBusy(connection(), { start, end: start + DAY })).rejects.toMatchObject({
+      needsReconnect: true,
+    })
+  })
+})
+
+/**
+ * The Calendar API being switched off in the operator's own Cloud project is a
+ * first-run failure, not an exotic one: creating OAuth credentials does not
+ * enable any API, so the very first deployment hits it. It matters that it is
+ * told apart from a revoked grant, because the two call for opposite advice —
+ * and "Reconnect" on a valid grant is a loop the host cannot escape or even
+ * diagnose.
+ *
+ * Body taken from Google's documented `accessNotConfigured` response.
+ */
+describe('un-enabled Calendar API', () => {
+  const ACCESS_NOT_CONFIGURED = {
+    error: {
+      code: 403,
+      message:
+        'Google Calendar API has not been used in project 123456 before or it is disabled. ' +
+        'Enable it by visiting https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=123456 then retry.',
+      errors: [{ message: 'Access Not Configured.', domain: 'usageLimits', reason: 'accessNotConfigured' }],
+      status: 'PERMISSION_DENIED',
+      details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'SERVICE_DISABLED' }],
+    },
+  }
+
+  it('surfaces as needs-setup rather than needs-reconnect', async () => {
+    const { fetchImpl } = scriptGoogle([
+      [/calendarList/, () => ({ status: 403, json: ACCESS_NOT_CONFIGURED })],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+
+    const err = await provider.listCalendars(connection()).then(() => null, (e: unknown) => e)
+    expect(needsSetup(err)).toBe(true)
+    // The distinction IS the fix: classify this as needs-reconnect and the host
+    // is sent to re-grant access that was never the problem.
+    expect(needsReconnect(err)).toBe(false)
+  })
+
+  it('carries a fix the host can actually act on', async () => {
+    const { fetchImpl } = scriptGoogle([
+      [/calendarList/, () => ({ status: 403, json: ACCESS_NOT_CONFIGURED })],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+
+    const err = await provider.listCalendars(connection()).then(() => null, (e: unknown) => e)
+    // Not a status code and not a provider body — the console page to open.
+    expect((err as CalendarSetupRequiredError).howToFix).toContain(
+      'console.cloud.google.com/apis/library/calendar-json.googleapis.com',
+    )
+  })
+
+  it('classifies the three shapes Google reports it in, and nothing else', () => {
+    expect(isApiNotEnabled('"reason": "accessNotConfigured"')).toBe(true)
+    expect(isApiNotEnabled('"reason": "SERVICE_DISABLED"')).toBe(true)
+    expect(isApiNotEnabled('Google Calendar API has not been used in project 1 before')).toBe(true)
+    // A narrowed scope is a different failure with different advice: it really
+    // does need a reconnect, so it must not be absorbed here.
+    expect(isApiNotEnabled('{"error":"insufficientPermissions"}')).toBe(false)
+    expect(isApiNotEnabled('{"error":"invalid_grant"}')).toBe(false)
+  })
+
+  it('leaves a genuine scope failure classified as needs-reconnect', async () => {
+    const { fetchImpl } = scriptGoogle([
+      [/calendarList/, () => ({ status: 403, json: { error: { message: 'insufficientPermissions' } } })],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+
+    const err = await provider.listCalendars(connection()).then(() => null, (e: unknown) => e)
+    expect(needsReconnect(err)).toBe(true)
+    expect(needsSetup(err)).toBe(false)
+  })
+})
+
+/**
+ * The queue is at-least-once: a create that wrote the event and then failed
+ * to persist its id is redelivered. With the event id chosen up front from
+ * the booking and connection, the repeat is answered 409 and the event read
+ * back — no twin on the host's calendar.
+ */
+describe('idempotent event creation', () => {
+  const event = {
+    title: 'Intro call: Ada with Grace',
+    description: 'Participants…',
+    start: Date.UTC(2026, 8, 14, 9),
+    end: Date.UTC(2026, 8, 14, 9, 30),
+    attendees: [{ email: 'ada@example.com', name: 'Ada' }],
+    timezone: 'UTC',
+    idempotencyKey: 'bk_1:cal_1',
+  }
+
+  it('chooses the event id from the booking and connection, and reads the event back on a repeat', async () => {
+    const { fetchImpl, calls } = scriptGoogle([
+      [/\/events\/pu[a-v0-9]+/, () => ({ json: { id: 'ignored-by-google-it-echoes-ours', hangoutLink: 'https://meet.google.com/abc' } })],
+      [/\/events\?/, () => ({ status: 409, json: { error: { code: 409, message: 'The requested identifier already exists.' } } })],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const created = await provider.createEvent(connection({ calendarIdWrite: 'primary' }), event)
+    const insert = calls.find((c) => c.method === 'POST')!
+    expect((insert.body as { id: string }).id).toMatch(/^pu[a-v0-9]+$/)
+    // The read-back is of the id we chose, and its conference link is kept.
+    expect(calls.some((c) => c.method === 'GET' && c.url.includes(`/events/${(insert.body as { id: string }).id}`))).toBe(true)
+    expect(created.conferenceUrl).toBe('https://meet.google.com/abc')
+  })
+
+  it('the same key yields the same id on the next attempt; no key keeps a random conference request', async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    const { fetchImpl } = scriptGoogle([[/\/events\?/, (body) => { bodies.push(body as Record<string, unknown>); return { json: { id: 'evt_x' } } }]])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    await provider.createEvent(connection({ calendarIdWrite: 'primary' }), event)
+    await provider.createEvent(connection({ calendarIdWrite: 'primary' }), event)
+    expect(bodies[0]!['id']).toBe(bodies[1]!['id'])
+    const { idempotencyKey: _omit, ...anonymous } = event
+    await provider.createEvent(connection({ calendarIdWrite: 'primary' }), { ...anonymous, createConference: true })
+    expect(bodies[2]).not.toHaveProperty('id')
+    expect((bodies[2]!['conferenceData'] as { createRequest: { requestId: string } }).createRequest.requestId).toBe('cadence-rrrrrrrrrrrr')
+  })
+})
+
+describe('OAuth configuration', () => {
+  it('separates identity from calendar consent (ADR-0005 §1)', () => {
+    const oauth = createEnvOAuthCredentials(
+      { GOOGLE_CLIENT_ID: 'cid', GOOGLE_CLIENT_SECRET: 'csec' },
+      'https://calendar.example',
+    )
+    const identity = oauth.redirectUri('google', 'identity')
+    const calendar = oauth.redirectUri('google', 'calendar')
+    expect(identity).not.toBe(calendar)
+    expect(identity).toContain('calendar.example')
+    // Purpose is inside the registered URI, so a code issued for one flow is
+    // useless at the other endpoint.
+    expect(identity).toContain('identity')
+    expect(calendar).toContain('calendar')
+  })
+
+  it('reports a provider as unavailable when its credentials are absent', () => {
+    const oauth = createEnvOAuthCredentials({ GOOGLE_CLIENT_ID: 'cid', GOOGLE_CLIENT_SECRET: 'c' }, 'https://calendar.example')
+    expect(oauth.forProvider('google')).not.toBeNull()
+    // A self-hoster may configure only one provider; the other must not throw.
+    expect(oauth.forProvider('microsoft')).toBeNull()
+  })
+})
+
+/**
+ * Google provisions the Meet room asynchronously. `events.insert`
+ * can return 200 with `createRequest.status` still `pending` and no link.
+ * Reading only that response left conference_url null permanently: the
+ * confirmation is sent once, from the same sync, so nothing came later to
+ * fill it in and the guest got "link to follow" with nothing following.
+ */
+describe('a Meet room that is still being provisioned', () => {
+  const PENDING = {
+    id: 'evt_p',
+    conferenceData: { createRequest: { status: { statusCode: 'pending' } } },
+  }
+
+  it('re-reads the event until the link appears', async () => {
+    let gets = 0
+    const { fetchImpl, calls } = scriptGoogle([
+      [/\/events\?/, () => ({ json: PENDING })],
+      [
+        /\/events\/evt_p/,
+        () => {
+          gets += 1
+          return gets < 2
+            ? { json: PENDING }
+            : { json: { id: 'evt_p', hangoutLink: 'https://meet.google.com/late-link' } }
+        },
+      ],
+    ])
+
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const created = await provider.createEvent(connection(), {
+      title: 'Intro',
+      description: '',
+      start: Date.now() + DAY,
+      end: Date.now() + DAY + 30 * 60_000,
+      attendees: [{ email: 'guest@example.com' }],
+      timezone: TZ,
+      createConference: true,
+    })
+
+    expect(created.id).toBe('evt_p')
+    expect(created.conferenceUrl).toBe('https://meet.google.com/late-link')
+    // Every re-read must ask for conference data, or the link is invisible
+    // in the response for the same reason it was on insert.
+    const reads = calls.filter((c) => /\/events\/evt_p/.test(c.url))
+    expect(reads.length).toBeGreaterThan(0)
+    for (const r of reads) expect(r.url).toContain('conferenceDataVersion=1')
+  })
+
+  it('gives up on a FAILED provisioning instead of burning every attempt', async () => {
+    let gets = 0
+    const { fetchImpl } = scriptGoogle([
+      [/\/events\?/, () => ({ json: PENDING })],
+      [
+        /\/events\/evt_p/,
+        () => {
+          gets += 1
+          return { json: { id: 'evt_p', conferenceData: { createRequest: { status: { statusCode: 'failure' } } } } }
+        },
+      ],
+    ])
+
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const created = await provider.createEvent(connection(), {
+      title: 'Intro',
+      description: '',
+      start: Date.now() + DAY,
+      end: Date.now() + DAY + 30 * 60_000,
+      attendees: [{ email: 'guest@example.com' }],
+      timezone: TZ,
+      createConference: true,
+    })
+
+    expect(created.conferenceUrl).toBeUndefined()
+    expect(gets).toBe(1)
+  })
+
+  it('still returns the booking when the room never appears', async () => {
+    // The event EXISTS. Losing the booking because a conference is slow
+    // would be strictly worse than a missing link.
+    const { fetchImpl } = scriptGoogle([
+      [/\/events\?/, () => ({ json: PENDING })],
+      [/\/events\/evt_p/, () => ({ json: PENDING })],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const created = await provider.createEvent(connection(), {
+      title: 'Intro',
+      description: '',
+      start: Date.now() + DAY,
+      end: Date.now() + DAY + 30 * 60_000,
+      attendees: [{ email: 'guest@example.com' }],
+      timezone: TZ,
+      createConference: true,
+    })
+    expect(created.id).toBe('evt_p')
+    expect(created.conferenceUrl).toBeUndefined()
+  })
+
+  it('does not poll at all for a non-conference event type', async () => {
+    const { fetchImpl, calls } = scriptGoogle([[/\/events\?/, () => ({ json: { id: 'evt_x' } })]])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    await provider.createEvent(connection(), {
+      title: 'Phone call',
+      description: '',
+      start: Date.now() + DAY,
+      end: Date.now() + DAY + 30 * 60_000,
+      attendees: [{ email: 'guest@example.com' }],
+      timezone: TZ,
+    })
+    expect(calls.filter((c) => /\/events\/evt_x/.test(c.url))).toHaveLength(0)
+  })
+})
+
+describe('reading a linked organizer event', () => {
+  it('reads a known event and distinguishes organizer ownership from attendee copies', async () => {
+    const start = Date.UTC(2026,10,17,9)
+    const {fetchImpl,calls} = scriptGoogle([[/\/events\/event_1$/,()=>({json:{status:'confirmed',organizer:{self:true},
+      start:{dateTime:new Date(start).toISOString()},end:{dateTime:new Date(start+1_800_000).toISOString()},
+      attendees:[{email:'host@example.com',organizer:true},{email:'guest@example.com'}]}})]])
+    const provider=createGoogleProvider(deps(fetchImpl))
+    expect(await provider.getEvent!(connection(), 'event_1')).toEqual({cancelled:false,organizer:true,start,end:start+1_800_000,guests:['guest@example.com']})
+    expect(calls[0]?.method).toBe('GET')
+    expect(calls[0]?.url).toContain('/calendars/primary/events/event_1')
+  })
+  it('accepts a cancellation tombstone but does not invent organizer ownership', async () => {
+    const {fetchImpl}=scriptGoogle([[/\/events\//,()=>({json:{status:'cancelled',id:'event_1'}})]])
+    expect(await createGoogleProvider(deps(fetchImpl)).getEvent!(connection(),'event_1')).toEqual({cancelled:true,organizer:false})
+  })
+  it.each([
+    {status:'confirmed',start:{date:'2026-11-17'},end:{date:'2026-11-18'}},
+    {status:'confirmed',start:{dateTime:'2026-11-17T09:00:00Z'},end:{dateTime:'2026-11-17T08:00:00Z'}},
+    {status:'confirmed',start:{dateTime:'2026-11-17T09:00:00Z'},end:{dateTime:'2026-11-17T10:00:00Z'},recurringEventId:'series'},
+    {status:'confirmed',start:{dateTime:'2026-11-17T09:00:00Z'},end:{dateTime:'2026-11-17T10:00:00Z'},attendeesOmitted:true},
+  ])('refuses unsupported or incomplete event shapes',async(json)=>{
+    const {fetchImpl}=scriptGoogle([[/\/events\//,()=>({json})]])
+    await expect(createGoogleProvider(deps(fetchImpl)).getEvent!(connection(),'event_1')).rejects.toThrow()
+  })
+  it('does not turn a 404 into a cancellation',async()=>{
+    const {fetchImpl}=scriptGoogle([[/\/events\//,()=>({status:404,json:{error:{code:404}}})]])
+    await expect(createGoogleProvider(deps(fetchImpl)).getEvent!(connection(),'event_1')).rejects.toThrow()
+  })
+})
+
+describe('shared-calendar event reads', () => {
+  const range = { start:Date.UTC(2026, 2, 22), end:Date.UTC(2026, 2, 31) }
+  const timed = { start:{dateTime:'2026-03-23T09:00:00Z'}, end:{dateTime:'2026-03-23T10:00:00Z'} }
+  it('reads only the selected calendar and fields, paginates and masks private/confidential titles', async () => {
+    const {fetchImpl, calls} = scriptGoogle([
+      [/pageToken=more/, () => ({json:{accessRole:'owner',timeZone:'Europe/London',items:[
+        {summary:'Retreat', start:{date:'2026-03-29'}, end:{date:'2026-03-30'}},
+        { ...timed, status:'cancelled',summary:'Removed'},
+      ]}})],
+      [/\/events\?/, () => ({json:{accessRole:'owner',nextPageToken:'more',items:[
+        {...timed,summary:'Launch'}, {...timed,visibility:'private',summary:'Secret',attendees:[{email:'private@example.com'}]},
+        {...timed,visibility:'confidential',summary:'Another secret'}, {...timed,transparency:'transparent',summary:'Office hours'},
+      ]}})],
+    ])
+    const events = await createGoogleProvider(deps(fetchImpl)).sharedEvents!(connection(),'work@example.org',range)
+    expect(events.map(e=>e.title)).toEqual(['Launch',null,null,'Office hours','Retreat'])
+    expect(events.at(-1)!.end - events.at(-1)!.start).toBe(23*HOUR)
+    expect(JSON.stringify(events)).not.toContain('private@example.com')
+    for (const call of calls) {
+      const url = new URL(call.url)
+      expect(url.pathname).toContain('/calendars/work%40example.org/events')
+      expect(url.searchParams.get('fields')).not.toMatch(/attendees|description|location|conference/)
+      expect(url.searchParams.get('singleEvents')).toBe('true')
+    }
+  })
+  it('refuses details when the owner lost sharing authority', async () => {
+    const {fetchImpl} = scriptGoogle([[/events/,()=>({json:{accessRole:'reader',items:[{...timed,summary:'Hidden'}]}})]])
+    await expect(createGoogleProvider(deps(fetchImpl)).sharedEvents!(connection(),'work',range)).rejects.toThrow('unavailable')
+  })
+  it('reads a selected Microsoft calendar by ID, returning only ordinary titles and UTC times', async () => {
+    const {createMicrosoftProvider} = await import('../../src/adapters/microsoft/provider.js')
+    const item = {start:{dateTime:'2026-03-23T09:00:00',timeZone:'UTC'},end:{dateTime:'2026-03-23T10:00:00',timeZone:'UTC'},subject:'Launch'}
+    const {fetchImpl,calls} = scriptGoogle([
+      [/calendarView.*skiptoken/,()=>({json:{value:[{...item,sensitivity:'normal',subject:'Later'}]}})],
+      [/calendarView/,()=>({json:{'@odata.nextLink':'https://graph.microsoft.com/v1.0/me/calendars/cid/calendarView?skiptoken=two',
+        value:['normal','private','personal','confidential',null].map(sensitivity=>({...item,sensitivity}))}})],
+      [/calendars\/cid\?/,()=>({json:{canShare:true}})],
+    ])
+    const provider = createMicrosoftProvider(deps(fetchImpl))
+    const events = await provider.sharedEvents!(connection({provider:'microsoft'}),'cid',range)
+    expect(events.map(e=>e.title)).toEqual(['Launch',null,null,null,null,'Later'])
+    expect(events[0]?.start).toBe(Date.UTC(2026,2,23,9))
+    expect(calls.every(call=>call.url.includes('/calendars/cid'))).toBe(true)
+    const hostile = scriptGoogle([[/calendarView/,()=>({json:{value:[],'@odata.nextLink':'https://untrusted.example/steal'}})],
+      [/calendars\/cid\?/,()=>({json:{canShare:true}})]])
+    await expect(createMicrosoftProvider(deps(hostile.fetchImpl)).sharedEvents!(connection({provider:'microsoft'}),'cid',range)).rejects.toThrow('Invalid calendar page')
+    expect(hostile.calls.every(c=>c.url.startsWith('https://graph.microsoft.com/'))).toBe(true)
+  })
+})

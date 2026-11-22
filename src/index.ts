@@ -1,0 +1,280 @@
+/**
+ * The Worker entry point — the OSS deployment.
+ *
+ * This file is the ONLY place bindings are read. Everything below it receives
+ * ports (ADR-0003), which is what lets `cloud/` reuse the identical engine with
+ * tenant-scoped repositories and its own credentials.
+ *
+ * A self-hoster's whole setup is: create a D1 and a KV, put two secrets in,
+ * `npm run migrate`, `wrangler deploy`.
+ */
+
+import { createEngine } from './engine.js'
+import { createD1Repositories } from './adapters/d1/repositories.js'
+import { createWebCrypto } from './adapters/crypto/webcrypto.js'
+import { createKvCache } from './adapters/cache/kv.js'
+import { createKvBlobCache } from './adapters/cache/kv-blob.js'
+import { createR2BlobStorage } from './adapters/storage/r2-blob.js'
+import { createBrevoSender, createCloudflareSender, createConsoleSender, createResendSender } from './adapters/email/index.js'
+import { selectEmailDelivery } from './adapters/email/select.js'
+import { createAnalyticsEngineInsights } from './adapters/insights/analytics-engine.js'
+import { createZoneAnalytics } from './adapters/insights/zone-analytics.js'
+import { createEnvOAuthCredentials } from './adapters/oauth.js'
+import { createCalendarProviders } from './adapters/providers.js'
+import { createCoordinator } from './adapters/coordinator.js'
+import { createQueueAdapter } from './adapters/queue/index.js'
+import { createRateLimiterAdapter } from './adapters/rate-limiter.js'
+import { handleOne, handleQueueBatch } from './adapters/queue/consumer.js'
+import { runScheduledTasks } from './adapters/scheduled.js'
+import { parseSignupPolicy } from './core/domain/auth-flows.js'
+import type { EnginePorts, RequestScope } from './ports.js'
+
+export { HostCalendar } from './do/host-calendar.js'
+export { RateLimiter } from './do/rate-limiter.js'
+
+export interface Env {
+  PROTOCOL_NAMESPACE?: string
+  INVITATION_UID_DOMAIN?: string
+  TELEMETRY_URL?: string
+  DB: D1Database
+  CACHE: KVNamespace
+  /** Host avatars and team logos — see `ports.ts`'s `BlobStorage` doc comment. */
+  AVATARS?: R2Bucket
+  HOST_CALENDAR: DurableObjectNamespace
+  RATE_LIMITER: DurableObjectNamespace
+  TASKS?: Queue
+  BASE_URL: string
+  BRAND_NAME?: string
+  LEGAL_OPERATOR?: string
+  DEMO_BOOKING_PATH?: string
+  /** GA4 measurement id for the marketing/docs pages only — see EngineConfig.analyticsId in ports.ts. */
+  GA_MEASUREMENT_ID?: string
+  /** Signup policy: unset/"open", "closed", or a comma list of emails/@domains — see `SignupPolicy` in ports.ts. Set as a secret/var per deployment; never a public-repo default, which would lock a fresh self-hoster out of their own instance. */
+  SIGNUPS?: string
+  FROM_EMAIL?: string
+  FROM_NAME?: string
+  SUPPORT_EMAIL?: string
+  TELEMETRY_ENABLED?: string
+  ENCRYPTION_KEY_V1?: string
+  ENCRYPTION_KEY_V2?: string
+  SIGNING_KEY?: string
+  /** Cloudflare Email Service. Bound by `[[send_email]]` in wrangler.toml — no key, no secret. */
+  EMAIL?: SendEmail
+  /** Name the sender instead of inferring it: cloudflare | resend | brevo | console (adapters/email/select.ts). */
+  EMAIL_PROVIDER?: string
+  /** Workers Analytics Engine, for page and confirm views on the Insights page (`[[analytics_engine_datasets]]`). */
+  INSIGHTS?: AnalyticsEngineDataset
+  /** The dataset name the binding writes to; the SQL API reads it by name. Defaults to cadence_insights. */
+  INSIGHTS_DATASET?: string
+  /** Optional: an API token with Account Analytics Read, so the Insights page can read views back. */
+  INSIGHTS_API_TOKEN?: string
+  /** Needed with INSIGHTS_API_TOKEN: the Cloudflare account that owns the dataset. */
+  CLOUDFLARE_ACCOUNT_ID?: string
+  /** Optional: the zone BASE_URL lives in, so the Admin page can show the edge's view of traffic. */
+  CLOUDFLARE_ZONE_ID?: string
+  /** Optional: a token with Zone Analytics Read for that zone; INSIGHTS_API_TOKEN is used when this is unset. */
+  ZONE_ANALYTICS_TOKEN?: string
+  RESEND_API_KEY?: string
+  BREVO_API_KEY?: string
+  GOOGLE_CLIENT_ID?: string
+  GOOGLE_CLIENT_SECRET?: string
+  MICROSOFT_CLIENT_ID?: string
+  MICROSOFT_CLIENT_SECRET?: string
+}
+
+export function buildPorts(env: Env): EnginePorts {
+  const baseUrl = env.BASE_URL ?? 'http://localhost:8787'
+  // Fail fast on the template's placeholder rather than quietly building
+  // every magic-link, OAuth callback and manage URL against it — a deploy
+  // whose links all dead-end is far harder to diagnose than this error.
+  // The first deploy is when the real URL becomes known, so the guide's
+  // flow is: deploy, copy the URL wrangler printed, set BASE_URL, deploy
+  // again.
+  if (baseUrl.includes('YOUR-SUBDOMAIN')) {
+    throw new Error(
+      'BASE_URL in wrangler.toml is still the template placeholder. Set it to the URL ' +
+        '`wrangler deploy` printed (or your custom domain) and deploy again — every link in ' +
+        'emails, OAuth callbacks and manage pages is built from it.',
+    )
+  }
+
+  // Key material. A missing key is a hard failure rather than a silent
+  // fallback: silently encrypting refresh tokens with a default key would be
+  // worse than refusing to start.
+  const keys: Record<number, string> = {}
+  if (env.ENCRYPTION_KEY_V1) keys[1] = env.ENCRYPTION_KEY_V1
+  if (env.ENCRYPTION_KEY_V2) keys[2] = env.ENCRYPTION_KEY_V2
+  const currentVersion = env.ENCRYPTION_KEY_V2 ? 2 : 1
+
+  const crypto_ = createWebCrypto({
+    keys,
+    currentVersion,
+    signingKey: env.SIGNING_KEY ?? '',
+  })
+
+  const oauth = createEnvOAuthCredentials(env, baseUrl)
+  const cache = createKvCache(env.CACHE)
+  const blobCache = createKvBlobCache(env.CACHE)
+  const blobStorage = env.AVATARS ? createR2BlobStorage(env.AVATARS) : undefined
+  const clock = { now: () => Date.now() }
+
+  const repositories = (scope: RequestScope) => createD1Repositories(env.DB, scope)
+
+  const calendars = createCalendarProviders({
+    oauth,
+    crypto: crypto_,
+    clock,
+    // Persist rotated tokens immediately: Microsoft rotates the refresh token
+    // on every refresh, so failing to store it strands the connection.
+    onTokensRefreshed: async (connectionId: string, tokens) => {
+      const repos = createD1Repositories(env.DB, { consistency: 'bookmark' })
+      const conn = await repos.connections.byId(connectionId)
+      if (!conn) return
+      const { ciphertext, keyVersion } = await crypto_.encrypt(
+        JSON.stringify(tokens),
+        `${conn.userId}|${conn.provider}|${conn.id}`,
+      )
+      await repos.connections.updateTokens(connectionId, ciphertext, keyVersion)
+    },
+  })
+
+  // A self-hoster with no email provider still gets a working product; the
+  // emails land in `wrangler tail` rather than nowhere.
+  // Whichever provider is configured. Neither is required: with no key the
+  // sender logs, so a self-hoster has a working product on day one and can
+  // add deliverability later (ADR-0003 — the port exists so this is a choice,
+  // not a gate).
+  const emailFrom = env.FROM_EMAIL ?? 'hello@example.com'
+  const emailFromName = env.FROM_NAME ?? 'Cadence'
+  // Resolved ONCE, next to the sender it describes, so the two cannot drift:
+  // a mode that claimed 'brevo' while the console sender was actually wired
+  // would be worse than no signal at all.
+  // Inferred from what is configured, or named by EMAIL_PROVIDER — and then
+  // a missing key or binding is a reported problem, not a quiet fallback
+  // (adapters/email/select.ts).
+  const { delivery: emailDelivery, problem: emailProblem } = selectEmailDelivery(env)
+  const email =
+    emailDelivery === 'cloudflare'
+      ? createCloudflareSender({ binding: env.EMAIL!, from: emailFrom, fromName: emailFromName })
+      : emailDelivery === 'resend'
+        ? createResendSender({ apiKey: env.RESEND_API_KEY!, from: emailFrom, fromName: emailFromName })
+        : emailDelivery === 'brevo'
+          ? createBrevoSender({ apiKey: env.BREVO_API_KEY!, from: emailFrom, fromName: emailFromName })
+          : createConsoleSender()
+
+  if (emailProblem) console.warn(`[cadence] ${emailProblem}. See /health and docs/self-hosting.md.`)
+  if (emailDelivery === 'console') {
+    // Loud, once, at boot. On its own this catches nothing (nobody tails a
+    // healthy Worker), which is why /health and the dashboard carry the same
+    // signal — but it costs nothing and it is the first place someone
+    // debugging "where did my confirmation go" will look.
+    console.warn(
+      '[cadence] No email provider is configured (no [[send_email]] binding, RESEND_API_KEY or BREVO_API_KEY). Emails are being LOGGED, NOT SENT — ' +
+        'guests will receive no booking confirmations. See /health and docs/self-hosting.md.',
+    )
+  }
+
+  // Without a TASKS binding, run notifications and calendar sync inline.
+  // Late-bound because handleOne needs the finished ports.
+  let portsRef: EnginePorts
+  const queue = createQueueAdapter(env.TASKS, async (message) => {
+    await handleOne(message, portsRef)
+  })
+  const rateLimiter = createRateLimiterAdapter(env.RATE_LIMITER)
+
+  const ports: EnginePorts = {
+    repositories,
+    calendars,
+    oauth,
+    email,
+    crypto: crypto_,
+    cache,
+    blobCache,
+    ...(blobStorage ? { blobStorage } : {}),
+    clock,
+    queue,
+    rateLimiter,
+    zoneAnalytics: createZoneAnalytics({
+      ...(env.CLOUDFLARE_ZONE_ID ? { zoneId: env.CLOUDFLARE_ZONE_ID } : {}),
+      ...((env.ZONE_ANALYTICS_TOKEN ?? env.INSIGHTS_API_TOKEN) ? { apiToken: env.ZONE_ANALYTICS_TOKEN ?? env.INSIGHTS_API_TOKEN } : {}),
+      host: new URL(baseUrl).host,
+      cache,
+    }),
+    insights: createAnalyticsEngineInsights({
+      ...(env.INSIGHTS ? { dataset: env.INSIGHTS } : {}),
+      datasetName: env.INSIGHTS_DATASET ?? 'cadence_insights',
+      ...(env.CLOUDFLARE_ACCOUNT_ID ? { accountId: env.CLOUDFLARE_ACCOUNT_ID } : {}),
+      ...(env.INSIGHTS_API_TOKEN ? { apiToken: env.INSIGHTS_API_TOKEN } : {}),
+    }),
+    config: {
+      baseUrl,
+      brandName: env.BRAND_NAME ?? 'Cadence',
+      ...(env.LEGAL_OPERATOR ? { legalOperator: env.LEGAL_OPERATOR } : {}),
+      ...(env.DEMO_BOOKING_PATH ? { demoBookingPath: env.DEMO_BOOKING_PATH } : {}),
+      ...(env.GA_MEASUREMENT_ID ? { analyticsId: env.GA_MEASUREMENT_ID } : {}),
+      ...(env.SIGNUPS ? { signupPolicy: parseSignupPolicy(env.SIGNUPS) } : {}),
+      supportEmail: env.SUPPORT_EMAIL ?? 'hello@example.com',
+      fromEmail: env.FROM_EMAIL ?? 'hello@example.com',
+      fromName: env.FROM_NAME ?? 'Cadence',
+      emailDelivery,
+      ...(emailProblem ? { emailProblem } : {}),
+      protocolNamespace: env.PROTOCOL_NAMESPACE,
+      invitationUidDomain: env.INVITATION_UID_DOMAIN,
+      telemetryUrl: env.TELEMETRY_URL,
+      telemetryEnabled: env.TELEMETRY_ENABLED === '1',
+    },
+    // Constructed last: it needs the other ports.
+    coordinator: undefined as never,
+  }
+
+  portsRef = ports
+  ports.coordinator = createCoordinator({
+    ports,
+    hostCalendarNamespace: env.HOST_CALENDAR,
+    repositories: () => createD1Repositories(env.DB, { consistency: 'bookmark' }),
+  })
+
+  return ports
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const engine = createEngine(buildPorts(env))
+    return engine.fetch(request, env, ctx)
+  },
+
+  async queue(batch: MessageBatch, env: Env): Promise<void> {
+    // A misconfigured deployment (no key material) must surface as a named
+    // error and retried messages, not an unhandled rejection with no context.
+    let ports: EnginePorts
+    try {
+      ports = buildPorts(env)
+    } catch (err) {
+      console.error('[cadence] cannot process queue: engine misconfigured', err)
+      for (const m of batch.messages) m.retry()
+      return
+    }
+    await handleQueueBatch(batch, ports)
+  },
+
+  /**
+   * Every 5 minutes: expire holds, send due reminders, prune old locks.
+   *
+   * A 5-minute tick is deliberate — reminders are "24h before" and "1h
+   * before", and finer granularity would cost Cron invocations to deliver an
+   * email nobody notices arriving 4 minutes early.
+   */
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    try {
+      // The catch below only covers synchronous buildPorts; the task's own
+      // rejection has to be caught on the promise handed to waitUntil.
+      ctx.waitUntil(
+        runScheduledTasks(buildPorts(env), event.scheduledTime).catch((err) =>
+          console.error('[cadence] scheduled tasks failed', err),
+        ),
+      )
+    } catch (err) {
+      console.error('[cadence] cannot run scheduled tasks: engine misconfigured', err)
+    }
+  },
+}

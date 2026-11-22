@@ -1,0 +1,20 @@
+name = "cadence-booking-local-preview"
+main = "src/mounted/preview.ts"
+compatibility_date = "2026-08-18"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+[alias]
+harfbuzzjs = "./src/adapters/image/harfbuzz.ts"
+
+[define]
+__filename = '"/worker.js"'
+__dirname = '"/"'
+
+[dev]
+port = 8790
+
+[assets]
+directory = "./assets"
+binding = "ASSETS"
+run_worker_first = true

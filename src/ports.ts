@@ -1,0 +1,1073 @@
+import type { InstanceBranding } from './core/domain/branding.js'
+/**
+ * The engine's ports (ADR-0003).
+ *
+ * Every capability the engine needs arrives through this interface. Nothing in
+ * the engine reaches for a global binding — a direct `env.DB` reference in core
+ * or the services is a review-blocking defect, because it is exactly what makes
+ * the cloud control-plane unable to inject its own tenant-scoped implementation.
+ *
+ * Note what is deliberately absent: there is no `Limits` or `PolicyGate` port.
+ * Putting the mechanism of gating into publicly readable MIT code would make
+ * the pledge read as conditional no matter how the default is set. The
+ * control-plane enforces its limits in its own layer, before calling the
+ * engine. See ADR-0003 §4.
+ */
+
+import type { ActivityOperation, ActivityRole } from './core/domain/booking-activity.js'
+import type { ReminderRule } from './core/domain/reminders.js'
+import type { HomeOwner } from './core/domain/home.js'
+import type { BookingDayStats, InsightEvent, InsightsPeriod, InsightsViews } from './core/domain/insights.js'
+import type { ChannelOwnerKind, NotificationChannel } from './core/domain/chat-notify.js'
+import type { WebhookEvent,
+  ApiKey,
+  CompanyLogo,
+  Booking,
+  CalendarConnection,
+  EventType,
+  EventTypeHost,
+  Interval,
+  MagicLinkToken,
+  Schedule,
+  Session,
+  SlotHold,
+  Team,
+  TeamMember,
+  TeamRole,
+  User,
+  Webhook,
+} from './core/domain/types.js'
+
+// ---------------------------------------------------------------------------
+// Repositories
+// ---------------------------------------------------------------------------
+
+/**
+ * Persistence. Methods take NO tenant_id: the engine is single-tenant by
+ * construction, because for self-hosters it is. The cloud control-plane
+ * supplies an implementation that closes over the tenant resolved from the
+ * request host, so the engine has no vocabulary for a cross-tenant query.
+ *
+ * Constructed per request and closing over a D1 session (ADR-0007 §1), which
+ * is why read locality is a property of the adapter rather than of call sites.
+ */
+export interface CalendarSelection { connectionId: string; calendarId: string }
+export interface CalendarShare { ownerId: string; viewerId: string; calendars: CalendarSelection[] }
+export interface SharedCalendarEvent extends Interval { title: string | null; allDay?: boolean; free?: boolean }
+
+export interface ActivityRow {
+  id: string
+  bookingId: string
+  revision: number
+  operation: ActivityOperation | 'unknown'
+  action: string
+  target: string
+  role: ActivityRole
+  recipient: string
+  detail: string
+  state: 'queued' | 'running' | 'accepted' | 'console' | 'failed' | 'uncertain' | 'done' | 'bounced' | 'delivered' | 'superseded'
+  created: number
+  updated: number
+  retried: number
+  validity?: string | null
+  transitions?: string
+  payload: string | null
+  receipt: string | null
+}
+
+export interface Repositories {
+  activity?: {
+    expireClaims(before: number, at: number): Promise<void>
+    add(row: ActivityRow): Promise<void>
+    list(bookingId: string): Promise<ActivityRow[]>
+    get(id: string): Promise<ActivityRow | null>
+    change(id: string, expected: ActivityRow['state'], state: ActivityRow['state'], at: number,
+      options?: { manual?: boolean; bookingRevision?: number; expectedValidity?: string | null; payload?: string | null; receipt?: string | null }): Promise<boolean>
+    patchCalendar(bookingId: string, revision: number | null, connectionId: string, externalId: string | null, conference: string | null): Promise<boolean>
+  }
+  calendarShares: {
+    teammates(userId: string): Promise<Array<Pick<User, 'id' | 'name' | 'slug'>>>
+    forUser(userId: string): Promise<CalendarShare[]>
+    save(ownerId: string, viewerId: string, calendars: CalendarSelection[]): Promise<boolean>
+    revoke(ownerId: string, viewerId: string): Promise<void>
+  }
+  users: UserRepository
+  eventTypes: EventTypeRepository
+  availability: AvailabilityRepository
+  bookings: BookingRepository
+  slotLocks: SlotLockRepository
+  teams: TeamRepository
+  eventTypeHosts: EventTypeHostRepository
+  connections: CalendarConnectionRepository
+  sessions: SessionRepository
+  apiKeys: ApiKeyRepository
+  webhooks: WebhookRepository
+  channels: NotificationChannelRepository
+  idempotency: IdempotencyRepository
+  settings: SettingsRepository
+
+  /** Counts for the opt-in telemetry ping (ADR-0006 §5). Nothing identifying. */
+  telemetryCounts(): Promise<{ users: number; eventTypes: number; bookings: number }>
+
+  /**
+   * The bookmark for this session's most recent write (ADR-0007 §2).
+   * Persisted on the host's session row so a host never reads a replica older
+   * than their own last edit. Null when nothing was written.
+   */
+  bookmark(): string | null
+}
+
+export interface UserRepository {
+  byId(id: string): Promise<User | null>
+  byEmail(email: string): Promise<User | null>
+  bySlug(slug: string): Promise<User | null>
+  /** @returns null when `user.slug` lost a race against a concurrent claim — see `TeamRepository.createWithFirstMember`. */
+  create(user: Omit<User, 'createdAt'>): Promise<User | null>
+  /** Every user, oldest first — the admin page's user list. A single team's worth of rows, not a paginated feed. */
+  listAll(): Promise<User[]>
+  /** Everyone with a digest hour set — the cron's candidates; `digestDue` decides who is actually due. */
+  listDigestRecipients(): Promise<User[]>
+  /**
+   * Claim today's digest BEFORE sending: true when this call moved the marker to `localDate`,
+   * false when it already was — one conditional UPDATE, so two overlapping ticks cannot both win.
+   */
+  claimDigest(id: string, localDate: string): Promise<boolean>
+  /** How many users exist at all — the first-user-becomes-admin bootstrap check. */
+  count(): Promise<number>
+  /**
+   * Atomically demote an admin to member, refusing when they are the LAST
+   * admin. The guard and the write are ONE statement — a separate
+   * count-then-update lets two concurrent demotions both pass the count and
+   * leave the instance with zero admins, a lockout only recoverable by
+   * hand-editing the database.
+   * @returns false when refused: the target is not an admin, or is the last one.
+   */
+  demoteAdmin(id: string): Promise<boolean>
+  /**
+   * @returns false if `patch.slug` collided with another row's unique slug —
+   * the caller's own read-then-write check (against users AND teams) closes
+   * most of that window, but not a concurrent write racing the same check.
+   * True for any other patch, including one that changes nothing.
+   */
+  update(
+    id: string,
+    patch: Partial<
+      Pick<User, 'name' | 'tz' | 'slug' | 'avatarKey' | 'company' | 'jobTitle' | 'companyUrl' | 'role' | 'digestHour' | 'appearance'>
+    >,
+  ): Promise<boolean>
+}
+
+/**
+ * Operator-editable instance settings, admin-managed from the dashboard.
+ * A plain key-value table — currently only `signups` (the signup policy in
+ * `SIGNUPS` env syntax). An env var with the same meaning always WINS over
+ * the stored setting, so an operator who pins configuration in wrangler.toml
+ * or a secret is never silently overridden from the UI.
+ */
+export interface SettingsRepository {
+  get(key: string): Promise<string | null>
+  /** The rows for these keys, in one round trip; absent keys are absent. */
+  getMany(keys: readonly string[]): Promise<Record<string, string>>
+  set(key: string, value: string, now: number): Promise<void>
+}
+
+export interface EventTypeRepository {
+  saveReminders(id: string, previous: NonNullable<EventType['reminderRules']>, rules: NonNullable<EventType['reminderRules']>): Promise<boolean>
+  byId(id: string): Promise<EventType | null>
+  bySlug(ownerSlug: string, eventSlug: string): Promise<EventType | null>
+  /**
+   * Host and event type in ONE round trip.
+   *
+   * Measured on the deployed Worker (2026-08-14): the edge alone answers in
+   * ~100 ms, while the booking page took ~380 ms because it made six
+   * sequential D1 calls at ~40 ms each. Round-trip COUNT dominates replica
+   * distance, so the page's first two lookups are collapsed here rather than
+   * being two awaits that read nicely.
+   */
+  bookingPageContext(
+    ownerSlug: string,
+    eventSlug: string,
+  ): Promise<{ host: User; eventType: EventType; team: Team | null; companyLogo: CompanyLogo | null; faviconKey: string | null; branding?: InstanceBranding } | null>
+  listForUser(userId: string): Promise<EventType[]>
+  listForTeam(teamId: string): Promise<EventType[]>
+  /**
+   * Every active event type on the instance with the slug and name its
+   * booking link starts with — the user's or the team's. For the instance
+   * homepage and the admin's picker for it (core/domain/home.ts).
+   */
+  listActiveWithOwners(): Promise<Array<{ eventType: EventType; owner: HomeOwner }>>
+  create(et: Omit<EventType, 'createdAt'>): Promise<EventType>
+  update(id: string, patch: Partial<EventType>): Promise<void>
+  /**
+   * Refuses (returns `false`, no throw) while any upcoming confirmed booking
+   * still references this event type.
+   *
+   * Deleting one out from under a booking is not cosmetic: the queued
+   * calendar sync reads the event type to build the calendar entry AND to
+   * render the guest's confirmation, so a delete landing in that window
+   * leaves the guest with no email at all — they booked and heard nothing
+   *. Guarded inside the DELETE, same discipline as
+   * `AvailabilityRepository.delete` refusing a schedule an event type still
+   * points at.
+   */
+  delete(id: string, now: number): Promise<boolean>
+}
+
+export interface EventTypeHostRepository {
+  /** In `position` order. Empty = the event type has no explicit host set (see `EventTypeHost`). */
+  forEventType(eventTypeId: string): Promise<EventTypeHost[]>
+  /**
+   * Replace the whole host set in one atomic write; `position` is the array
+   * order. Refuses — returns `false`, writes nothing — when any host is not
+   * a member of the event type's owning team, or names a schedule that is
+   * not theirs. Both are checked inside the INSERT (a scalar subquery into a
+   * NOT NULL column), so a member removed or a schedule deleted between the
+   * caller's read and this write still fails the whole set rather than
+   * storing a dangling reference. An empty array clears the set, which
+   * means "every member" again.
+   */
+  replace(eventTypeId: string, hosts: Array<Omit<EventTypeHost, 'eventTypeId' | 'position'>>): Promise<boolean>
+  /**
+   * Insert any of `hosts` that are not already in the set, leaving existing
+   * rows untouched — the implicit-to-explicit conversion a host's own
+   * schedule choice triggers (dashboard "Team events"). Insert-if-absent
+   * rather than replace so two hosts converting the same event type at
+   * once each keep their own row and their own choice. Same membership
+   * guard as `replace`; a non-member is skipped, not stored.
+   */
+  ensure(eventTypeId: string, hosts: Array<Omit<EventTypeHost, 'eventTypeId' | 'position'>>): Promise<void>
+  /**
+   * Set (or clear, with null) one host's per-event schedule. Same guard as
+   * `replace` on the schedule. Returns `false` when the host row does not
+   * exist or the schedule is not theirs.
+   */
+  setSchedule(eventTypeId: string, userId: string, scheduleId: string | null): Promise<boolean>
+  /**
+   * Active event types of `teamId` on which `userId` is a REQUIRED host —
+   * the ones that block removing them from the team (`TeamRepository.removeMemberGuarded`).
+   */
+  requiredOn(teamId: string, userId: string): Promise<EventType[]>
+}
+
+export interface AvailabilityRepository {
+  /** The user's default schedule — used everywhere a call site hasn't opted into a specific one. */
+  forUser(userId: string): Promise<Schedule | null>
+  listForUser(userId: string): Promise<Schedule[]>
+  /** Scoped by `userId` so a schedule id belonging to a different host can never be read cross-user. */
+  byId(userId: string, scheduleId: string): Promise<Schedule | null>
+  /**
+   * `schedule.id` is pre-generated by the caller (same convention as
+   * `EventTypeRepository.create`). `actorId` is who is doing the writing —
+   * the owner themselves, or a team admin acting on their behalf
+   * (core/domain/teams.ts); it lands in `created_by`. Omitted = the owner.
+   */
+  create(userId: string, schedule: Schedule, actorId?: string): Promise<Schedule>
+  update(
+    userId: string,
+    scheduleId: string,
+    patch: Partial<Omit<Schedule, 'id' | 'userId' | 'isDefault' | 'createdBy'>>,
+    actorId?: string,
+  ): Promise<void>
+  /**
+   * Refuses (returns `false`, no error thrown) rather than delete when the
+   * target is the user's default schedule, their only remaining schedule, or
+   * still referenced by an event type (its own `scheduleId`, or a per-host
+   * row in `event_type_hosts`) — one D1-arbitrated statement, the
+   * same discipline as `UserRepository.demoteAdmin`'s last-admin guard, not
+   * an application-level check-then-delete.
+   */
+  delete(userId: string, scheduleId: string): Promise<boolean>
+  /**
+   * Atomically moves the default flag onto `scheduleId`. Returns `false` if
+   * `scheduleId` doesn't exist or isn't owned by `userId` — callers that
+   * need a specific error message should `byId` first to distinguish "not
+   * found" from a genuine failure.
+   */
+  setDefault(userId: string, scheduleId: string): Promise<boolean>
+  /**
+   * Insert only if the user has no default schedule yet; a no-op otherwise.
+   * For backfilling on login (auth-flows.ts) — a check-then-write (`forUser`
+   * then `create`) has a window where a concurrent real save (a host
+   * clearing their week from another device) can be overwritten by the
+   * backfill's default. This is the same window closed as a database
+   * constraint elsewhere in the codebase (`slot_locks`, `demoteAdmin`)
+   * rather than left as an application-level race.
+   */
+  saveIfAbsent(userId: string, schedule: Schedule): Promise<void>
+}
+
+export interface BookingRevision {
+  guestName?: string
+  guestEmail?: string
+  manageTokenHash?: string
+  startUtc: number
+  endUtc: number
+  localDate: string
+  additionalGuests: string[]
+  status: 'confirmed' | 'cancelled'
+  cancelledAt: number | null
+}
+
+export interface BookingRepository {
+  /** Compare-and-swap the revision and its slot locks in one transaction. */
+  revise(id: string, expectedRevision: number, token: string, patch: BookingRevision, buckets: BucketClaim[]): Promise<Booking | null>
+  forCalendarSync(limit: number): Promise<Booking[]>
+  recordCalendarCheck(id: string, at: number, error: string | null): Promise<void>
+  markCalendarSynced(id: string, revision: number): Promise<void>
+  byId(id: string): Promise<Booking | null>
+  byManageToken(tokenHash: string): Promise<Booking | null>
+  listForHost(hostUserId: string, range: Interval): Promise<Booking[]>
+  /**
+   * The host's bookings for the dashboard list, one view at a time.
+   * `upcoming` is confirmed and not yet over, soonest first; `past` is
+   * confirmed and over, most recent first; `cancelled` is cancelled, most
+   * recently cancelled first. "Over" means `end_utc <= now` rather than
+   * `start_utc`, so a meeting in progress still counts as upcoming — it is
+   * the one the host most needs to find. Same primary-OR-co-host match as
+   * `listForHost`, for the same reason.
+   */
+  listForHostByStatus(hostUserId: string, opts: BookingListOptions): Promise<Booking[]>
+  /**
+   * Confirmed bookings whose `start_utc` falls in `range` — the caller
+   * resolves a host-local calendar day to a UTC range (`dayRange`) before
+   * calling this, because only the caller knows which host's timezone that
+   * day is meant in. NOT a match against the stored `local_date` column:
+   * that column is stamped once, in a collective booking's PRIMARY host's
+   * timezone, so string-matching it for a non-primary host can miss rows
+   * near a timezone boundary and undercount their cap.
+   */
+  countForHostOnDate(hostUserId: string, range: Interval): Promise<number>
+  /**
+   * The funnel's bookings half (core/domain/insights.ts): per event type,
+   * per UTC day of `created_at` — new bookings (not reschedule
+   * replacements), reschedules (replacements created), and cancellations
+   * by `cancelled_at`. One query over `bookings_event_type_idx`.
+   */
+  statsForEventTypes(eventTypeIds: string[], range: Interval): Promise<BookingDayStats[]>
+
+  /**
+   * The atomic write (ADR-0002 §1). The booking row and one `slot_locks` row
+   * per 5-minute bucket per host go into a single `D1Database::batch()`. A
+   * conflicting bucket violates the primary key and the whole batch fails, so
+   * a partial booking cannot exist.
+   *
+   * Verified against production D1 on 2026-08-14: a constraint
+   * violation mid-batch rolls back every prior statement.
+   *
+   * @returns the booking on success; `null` when a bucket was already taken —
+   *          the caller turns that into a 409, never a retry loop.
+   */
+  createWithLocks(booking: Booking, buckets: BucketClaim[]): Promise<Booking | null>
+
+  /**
+   * Change who hosts an existing booking, keeping the invariant: the new
+   * host list, the new primary host, the incoming hosts' `slot_locks` rows
+   * (`claim`) and the outgoing hosts' rows (`release`) go into ONE batch,
+   * the same way `createWithLocks` writes a booking and its locks together.
+   * A claimed bucket someone else already holds fails the whole batch, so a
+   * host can no longer be put on a meeting that overlaps one they have.
+   *
+   * Only a `confirmed` booking is changed. A cancel or reschedule that lands
+   * between the caller's read and this write leaves nothing behind — no
+   * locks are inserted for a booking that no longer holds any.
+   *
+   * @returns the updated booking; `null` when a claimed bucket was taken or
+   *          the booking was no longer confirmed — either way nothing
+   *          changed, and the caller re-reads to tell the two apart.
+   */
+  replaceHosts(
+    bookingId: string,
+    /** The host list the caller read; the write applies only if the row still has it (compare-and-swap). */
+    expectedHostUserIds: string[],
+    hostUserIds: string[],
+    primaryHostId: string,
+    claim: BucketClaim[],
+    release: BucketClaim[],
+  ): Promise<Booking | null>
+
+  /**
+   * Confirmed bookings starting in `[from, to)`, across ALL hosts.
+   *
+   * Reminders need a cross-host query, which is precisely why bookings live in
+   * D1 rather than in per-host DO storage (ADR-0002 §2).
+   */
+  dueReminders(now: number): Promise<Array<{ bookingId: string; start: number; minutes: number }>>
+  claimReminder(booking: Booking, rule: ReminderRule, recipient: string, at: number): Promise<boolean>
+  finishReminder(booking: Booking, minutes: number, recipient: string, claimedAt: number, deliveredAt: number | null): Promise<void>
+  dueBetween(from: number, to: number): Promise<Booking[]>
+
+  /** @returns false if the booking was no longer `confirmed` — a concurrent cancel/reschedule won the race. */
+  cancelWithLockRelease(bookingId: string, at: number): Promise<boolean>
+  /** @returns false if the booking was no longer `confirmed` — the caller must roll back the new booking it just created. */
+  markRescheduled(bookingId: string, newBookingId: string): Promise<boolean>
+  rotateManageToken(bookingId: string, tokenHash: string): Promise<void>
+
+  /**
+   * Record the provider event ids created for a booking.
+   *
+   * Without these, reschedule and cancel have nothing to update or delete, so
+   * a cancelled meeting stays on the host's real calendar forever.
+   */
+  setExternalEventIds(bookingId: string, ids: Record<string, string>): Promise<void>
+  /**
+   * Record the event ids AND the conference link the provider minted, in one
+   * write. Separate from `setExternalEventIds` only because the ids alone are
+   * still the right write for a delete, which has no link to record.
+   */
+  setSyncResult(bookingId: string, ids: Record<string, string>, conferenceUrl: string | null): Promise<void>
+  /**
+   * Claim the right to send this booking's confirmation, exactly once.
+   *
+   * Returns true to the single caller that won. The calendar-sync handler is
+   * what dispatches confirmations now (it is the first point that knows the
+   * conference link), and `message.retry()` re-runs that handler — so without
+   * a DB-arbitrated claim a retried sync sends the guest a second
+   * confirmation. Same discipline as `demoteAdmin`: the condition lives
+   * inside the UPDATE, not in a read the caller does first.
+   */
+  claimConfirmation(bookingId: string, at: number): Promise<boolean>
+  /**
+   * Undo a claim whose send then failed, so a queue retry can re-send.
+   * Without it, claim-before-send turns any failure after the claim into a
+   * permanently missing confirmation that the record calls sent.
+   */
+  releaseConfirmationClaim(bookingId: string): Promise<void>
+}
+
+export type BookingListView = 'upcoming' | 'past' | 'cancelled'
+
+export interface BookingListOptions {
+  view: BookingListView
+  now: number
+  /** Cap on rows, so a busy host's history cannot become a full scan. */
+  limit: number
+}
+
+/** One 5-minute bucket claimed by a booking, for one host. */
+export interface BucketClaim {
+  hostUserId: string
+  bucketStart: number
+}
+
+export interface SlotLockRepository {
+  /** Buffered busy intervals from confirmed bookings. Pre-expanded by construction. */
+  busyBuckets(hostUserIds: string[], range: Interval): Promise<Map<string, number[]>>
+  /** Active advisory holds (`expires_at > now`), which suppress but never block. */
+  /**
+   * `excludeHoldId` omits the caller's own hold from the result — without it,
+   * a guest who holds a slot and then confirms it sees their own advisory
+   * hold reported back as busy, and the commit-time re-check rejects the
+   * booking the hold was placed to protect.
+   */
+  activeHolds(
+    hostUserIds: string[],
+    range: Interval,
+    now: number,
+    excludeHoldId?: string,
+  ): Promise<Map<string, number[]>>
+  createHold(hold: SlotHold, buckets: BucketClaim[]): Promise<boolean>
+  releaseHold(holdId: string): Promise<void>
+  expireHolds(before: number): Promise<number>
+  pruneLocksBefore(cutoff: number): Promise<number>
+}
+
+export interface TeamRepository {
+  byId(id: string): Promise<Team | null>
+  bySlug(slug: string): Promise<Team | null>
+  members(teamId: string): Promise<TeamMember[]>
+  memberships(userId: string): Promise<TeamMember[]>
+  /** @returns null when `team.slug` lost a race against a concurrent claim — see `createWithFirstMember`. */
+  create(team: Omit<Team, 'createdAt'>): Promise<Team | null>
+  /**
+   * Team row and its first membership in ONE atomic write. Creating them as
+   * two statements lets a transient failure between the two strand a
+   * memberless team — unmanageable by everyone, its slug squatted forever.
+   * @returns null when `team.slug` lost a race against a concurrent create —
+   *          the caller's own precheck is read-then-write and this is the
+   *          constraint that actually arbitrates it.
+   */
+  createWithFirstMember(
+    team: Omit<Team, 'createdAt'>,
+    member: Omit<TeamMember, 'teamId'>,
+  ): Promise<Team | null>
+  /** Every team on the instance, oldest first — for the instance admin's view, which is not membership-scoped. */
+  list(): Promise<Team[]>
+  /**
+   * Rename and/or re-slug a team. A slug change moves the team's claim in
+   * `slug_claims` in the same batch as the row update, so the shared
+   * user/team slug namespace is arbitrated by that table's primary key —
+   * the same shape as `UserRepository.update` with a slug.
+   * @returns false when the new slug is already claimed (nothing changed).
+   */
+  update(teamId: string, patch: Partial<Pick<Team, 'name' | 'slug' | 'showName' | 'appearance'>>): Promise<boolean>
+  /**
+   * Insert, or update the weight of, a membership. `member.role` applies to
+   * the INSERT only — an existing row keeps its role, because role changes
+   * go through `setRole` and its last-admin guard.
+   */
+  addMember(member: TeamMember): Promise<void>
+  removeMember(teamId: string, userId: string): Promise<void>
+  /**
+   * Atomically remove a member, refusing when they are the team's LAST
+   * member or its last admin. Same shape as `UserRepository.demoteAdmin`,
+   * for the same reason: the guard and the delete are ONE statement, so two
+   * concurrent removals on a two-admin team cannot both pass a separate
+   * count and leave the team with nobody who can manage it.
+   * @returns false when refused: not a member, the last member, or the last admin.
+   */
+  removeMemberGuarded(teamId: string, userId: string): Promise<boolean>
+  /**
+   * Change a member's role. Demoting the team's last admin is refused inside
+   * the UPDATE itself, same discipline as `UserRepository.demoteAdmin`: an
+   * admin-less team can be managed by nobody but an instance admin.
+   * @returns false when refused: not a member, or the last admin being demoted.
+   */
+  setRole(teamId: string, userId: string, role: TeamRole): Promise<boolean>
+  /** Round-robin tie-break: last booking time per member (ADR-0004 §5). */
+  lastAssignedAt(teamId: string, userIds: string[]): Promise<Map<string, number>>
+  /**
+   * Advance the rotation after a round-robin booking commits.
+   *
+   * Without this `lastAssignedAt` is always empty, every candidate scores the
+   * same, and the lowest-sorted host id wins forever — a waterfall, which is
+   * the opposite of what ADR-0004 §5 specifies.
+   */
+  recordAssignment(teamId: string, userId: string, at: number): Promise<void>
+}
+
+export interface CalendarConnectionRepository {
+  writableHostIds(userIds: string[], providers: CalendarProviderName[]): Promise<Set<string>>
+  byId(id: string): Promise<CalendarConnection | null>
+  listForUser(userId: string): Promise<CalendarConnection[]>
+  create(conn: CalendarConnection): Promise<CalendarConnection>
+  updateTokens(id: string, encryptedTokens: string, keyVersion: number): Promise<void>
+  updateSyncStatus(id: string, status: CalendarConnection['syncStatus']): Promise<void>
+  /** Set the provider's account address on a connection stored before it was known. */
+  updateAccountEmail(id: string, providerAccountEmail: string): Promise<void>
+  /**
+   * Rewrite only the calendar selection — never tokens, key version, sync
+   * status or provider account email. A single `UPDATE`, not delete+create,
+   * so a failure mid-write cannot destroy the row (which would force a full
+   * OAuth reconnect) or drop key-rotation continuity for the encrypted
+   * tokens.
+   */
+  updateCalendars(id: string, patch: { read: string[]; write: string | null }): Promise<void>
+  delete(id: string): Promise<void>
+}
+
+export interface SessionRepository {
+  byIdHash(idHash: string): Promise<Session | null>
+  create(session: Session): Promise<void>
+  touch(idHash: string, expiresAt: number, bookmark: string | null): Promise<void>
+  delete(idHash: string): Promise<void>
+  deleteAllForUser(userId: string): Promise<void>
+  createMagicLink(token: MagicLinkToken): Promise<void>
+  /** Single-use by construction: an atomic conditional delete. A replay finds nothing. */
+  consumeMagicLink(tokenHash: string, now: number): Promise<MagicLinkToken | null>
+}
+
+export interface ApiKeyRepository {
+  byPrefix(prefix: string): Promise<ApiKey | null>
+  listForUser(userId: string): Promise<ApiKey[]>
+  create(key: ApiKey): Promise<void>
+  delete(id: string): Promise<void>
+  touchLastUsed(id: string, at: number): Promise<void>
+}
+
+export interface WebhookRepository {
+  listForUser(userId: string): Promise<Webhook[]>
+  byId(id: string): Promise<Webhook | null>
+  create(webhook: Webhook): Promise<void>
+  delete(id: string): Promise<void>
+}
+
+/** Slack / Telegram destinations for booking notifications (core/domain/chat-notify.ts). */
+export interface NotificationChannelRepository {
+  listForOwner(ownerKind: ChannelOwnerKind, ownerId: string): Promise<NotificationChannel[]>
+  byId(id: string): Promise<NotificationChannel | null>
+  create(channel: NotificationChannel): Promise<void>
+  delete(id: string): Promise<void>
+}
+
+export interface IdempotencyRepository {
+  get(key: string, scope: string): Promise<StoredIdempotentResponse | null>
+  put(record: StoredIdempotentResponse): Promise<void>
+  /**
+   * Atomically claim a (key, scope) pair before doing the work it guards.
+   *
+   * `get`-then-work-then-`put` is a race: two requests with the same
+   * idempotency key can both read "nothing yet" and both go on to create a
+   * real booking. `reserve` is the compare-and-swap that closes that window —
+   * only the caller that wins gets `reserved: true`; the loser gets back
+   * whatever is already stored (a placeholder mid-flight, or a finished
+   * response to replay) and must not do the work itself.
+   */
+  reserve(
+    record: StoredIdempotentResponse,
+  ): Promise<{ reserved: true } | { reserved: false; existing: StoredIdempotentResponse }>
+}
+
+export interface StoredIdempotentResponse {
+  key: string
+  scope: string
+  requestHash: string
+  responseJson: string
+  status: number
+  expiresAt: number
+}
+
+// ---------------------------------------------------------------------------
+// Calendar providers
+// ---------------------------------------------------------------------------
+
+export type CalendarProviderName = 'google' | 'microsoft'
+
+export interface CalendarEventSnapshot {
+  cancelled: boolean
+  organizer: boolean
+  start?: number
+  end?: number
+  guests?: string[]
+}
+
+export interface CalendarProvider {
+  readonly name: CalendarProviderName
+  /** Read only a known organizer event; missing/access-denied is not a cancellation. */
+  getEvent?(conn: CalendarConnection, externalId: string): Promise<CalendarEventSnapshot>
+  /** Sanitized titles and times, only for a calendar explicitly shared with this viewer. */
+  sharedEvents?(conn: CalendarConnection, calendarId: string, range: Interval): Promise<SharedCalendarEvent[]>
+  /** Raw busy intervals, never buffer-expanded — buffers belong to the slot engine. */
+  getBusy(conn: CalendarConnection, range: Interval, incomplete?: (ids: string[], error: unknown) => void): Promise<Interval[]>
+  createEvent(conn: CalendarConnection, event: ExternalEvent): Promise<CreatedEvent>
+  updateEvent(conn: CalendarConnection, externalId: string, event: ExternalEvent): Promise<void>
+  deleteEvent(conn: CalendarConnection, externalId: string): Promise<void>
+  /**
+   * The account's calendars. `accountEmail` is the address the provider
+   * shows as the calendar's owner where it does — Google's primary calendar
+   * id, Graph's `owner.address` — and is how a connection learns which
+   * account it is for, since the calendar flow asks for no identity scope.
+   */
+  listCalendars(conn: CalendarConnection): Promise<Array<{ id: string; name: string; primary: boolean; accountEmail?: string; canShareDetails?: boolean }>>
+}
+
+/**
+ * What a provider hands back from a create.
+ *
+ * `conferenceUrl` is the whole point of this being a record rather than a
+ * bare id: both Google and Graph return the meeting link they just minted in
+ * the create response, and the engine used to read only the id and throw the
+ * link away — leaving guests with an invite that said "link in the calendar
+ * invite" and contained no link.
+ */
+export interface CreatedEvent {
+  id: string
+  /** Absent for a non-conference event type, or if the provider minted none. */
+  conferenceUrl?: string
+}
+
+export interface ExternalEvent {
+  title: string
+  description: string
+  start: number
+  end: number
+  /** `optional` marks a host who joins when free (Google `optional`, Graph `type: optional`). */
+  attendees: Array<{ email: string; name?: string; optional?: boolean }>
+  location?: string
+  /** Ask the provider to mint a conference link (Google Meet). */
+  createConference?: boolean
+  timezone: string
+  /**
+   * Identity of this event across retries — booking id + connection id.
+   * Providers derive their idempotency keys from it (adapters/calendar-ids.ts)
+   * so a redelivered create returns the original event instead of a twin.
+   */
+  idempotencyKey?: string
+}
+
+export interface CalendarProviders {
+  get(name: CalendarProviderName): CalendarProvider
+  available(): CalendarProviderName[]
+}
+
+// ---------------------------------------------------------------------------
+// OAuth credentials
+// ---------------------------------------------------------------------------
+
+/**
+ * Where OAuth client credentials come from. In OSS, environment variables —
+ * the self-hoster brings their own app. In cloud, our verified applications.
+ * Identity and calendar are separate scopes for the same client (ADR-0005 §1).
+ */
+export interface OAuthCredentials {
+  forProvider(name: CalendarProviderName): { clientId: string; clientSecret: string } | null
+  redirectUri(name: CalendarProviderName, purpose: 'identity' | 'calendar'): string
+}
+
+// ---------------------------------------------------------------------------
+// Email
+// ---------------------------------------------------------------------------
+
+export interface EmailSender {
+  send(message: EmailMessage, idempotencyKey?: string): Promise<void | {id: string}>
+  deliveryState?(id: string): Promise<'bounced' | 'delivered' | null>
+}
+
+export interface EmailMessage {
+  /** Internal reminder revision checked by the queue before handing mail to a provider. */
+  reminderRuleHash?: string
+  to: string
+  toName?: string
+  subject: string
+  html: string
+  text: string
+  /** Base64-encoded file bytes; adapters convert to the provider's representation. */
+  attachments?: Array<{ filename: string; content: string; contentType: string }>
+  replyTo?: string
+}
+
+// ---------------------------------------------------------------------------
+// Crypto
+// ---------------------------------------------------------------------------
+
+/**
+ * AES-GCM for refresh tokens at rest, HMAC for signed links (ADR-0005 §4, §6).
+ * `keyVersion` travels with every ciphertext so keys rotate by
+ * decrypt-with-old/encrypt-with-new without downtime — which only works
+ * because the column exists from day one.
+ */
+export interface Crypto {
+  encrypt(plaintext: string, aad: string): Promise<{ ciphertext: string; keyVersion: number }>
+  decrypt(ciphertext: string, aad: string, keyVersion: number): Promise<string>
+  sign(payload: string): Promise<string>
+  verify(payload: string, signature: string): Promise<boolean>
+  randomToken(bytes?: number): string
+  hash(value: string): Promise<string>
+}
+
+// ---------------------------------------------------------------------------
+// Cache
+// ---------------------------------------------------------------------------
+
+/**
+ * External-calendar freeBusy only (ADR-0006 §1). Own bookings and holds are
+ * always read from D1, because those are the writes users notice immediately.
+ * KV propagates in "up to 60 seconds or more", so it can never be authoritative.
+ */
+export interface Cache {
+  get<T>(key: string): Promise<T | null>
+  put<T>(key: string, value: T, ttlSeconds: number): Promise<void>
+  delete(key: string): Promise<void>
+}
+
+/**
+ * Non-authoritative BINARY derived content — currently only rendered OG card
+ * PNGs. Same trust category as `Cache` above (advisory, staleness
+ * of an hour is fine, never a source of truth) and the same physical KV
+ * namespace in the default adapter, but a separate port because the values
+ * are raw bytes, not JSON: round-tripping a PNG through `Cache.put` would
+ * JSON-encode it byte-by-byte, several times the size for no reason.
+ *
+ * Still bound by ADR-0006 §1's actual rule: bookings and holds never go
+ * through KV in any form. This port cannot be given booking data, but it
+ * exists precisely because "freeBusy only" was never about banning KV from
+ * holding a SECOND kind of disposable, re-derivable content.
+ */
+export interface BlobCache {
+  get(key: string): Promise<Uint8Array | null>
+  put(key: string, value: Uint8Array, ttlSeconds: number): Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// Signup policy
+// ---------------------------------------------------------------------------
+
+/**
+ * Who may CREATE an account on this deployment. Existing users always sign
+ * in regardless — this gates the find-or-create's create branch only, which
+ * both the magic-link and OAuth identity flows funnel through
+ * (`consumeMagicLink` in core/domain/auth-flows.ts).
+ *
+ *  - 'open':      anyone (the default — a fresh self-host must let its own
+ *                 operator register before anything else exists)
+ *  - 'closed':    nobody new
+ *  - 'allowlist': lowercase exact emails and `@domain` suffixes
+ *
+ * Parsed from the `SIGNUPS` env var by `parseSignupPolicy`.
+ */
+export type SignupPolicy =
+  | { mode: 'open' }
+  | { mode: 'closed' }
+  | { mode: 'allowlist'; entries: string[] }
+
+/**
+ * User-uploaded binary content: host avatars and team logos.
+ * Deliberately a THIRD storage port, not a reuse of `Cache` or `BlobCache`
+ * above, because the trust category is different from both:
+ *
+ *  - Not `Cache` — not JSON, and not re-derivable from anything else the
+ *    engine has.
+ *  - Not `BlobCache` — not ephemeral or advisory. A host's uploaded photo is
+ *    authoritative content with no TTL; losing it is a real loss, the same
+ *    way losing a booking row would be, even though (unlike a booking) it
+ *    carries no freshness requirement and is fine to read from KV-speed
+ *    storage.
+ *
+ * Backed by R2 in the default adapter — durable object storage, not the KV
+ * namespace `Cache`/`BlobCache` share, and not gated behind a paid plan
+ * (R2's free tier is part of the same "$0 to start" pledge as D1 and KV).
+ * Keys are content-addressed (`core/domain/media.ts`), so `put` is naturally
+ * idempotent and needs no separate existence check to avoid duplicate writes.
+ */
+export interface BlobStorage {
+  get(key: string): Promise<{ bytes: Uint8Array; contentType: string } | null>
+  put(key: string, value: Uint8Array, contentType: string): Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// Clock
+// ---------------------------------------------------------------------------
+
+/** A port purely so the ADR-0004 DST matrix can freeze time without globals. */
+export interface Clock {
+  now(): number
+}
+
+// ---------------------------------------------------------------------------
+// Queue
+// ---------------------------------------------------------------------------
+
+export interface QueuePort {
+  send(message: QueueMessage): Promise<void>
+  sendBatch(messages: QueueMessage[]): Promise<void>
+}
+
+export type QueueMessage =
+  | { kind: 'email'; message: EmailMessage; activityId?: string }
+  | { kind: 'reminder'; bookingId: string; start: number; minutes: number }
+  | { kind: 'webhook'; webhookId: string; event: string; payload: unknown; attempt: number }
+  /** A booking notification to a Slack or Telegram channel; the message is built at delivery time from the booking's current state. */
+  | { kind: 'chat'; channelId: string; event: WebhookEvent; bookingId: string; extra?: { hostsAdded?: string[]; hostsRemoved?: string[] } }
+  | {
+      kind: 'calendar.sync'
+      bookingId: string
+      action: 'create' | 'update' | 'delete'
+      /**
+       * The booking's raw manage token, carried so the create handler can
+       * dispatch the confirmation without re-issuing one.
+       *
+       * Re-issuing looked safer but is not: the coordinator hands this same
+       * token to the just-booked page, whose "Reschedule or cancel" button
+       * embeds it, and rotating the stored hash would kill that button
+       * seconds after the guest was shown it. Carrying it adds no exposure —
+       * the rendered confirmation email already contains this token and is
+       * itself a queue message.
+       */
+      manageToken?: string
+    }
+
+// ---------------------------------------------------------------------------
+// Coordination
+// ---------------------------------------------------------------------------
+
+/**
+ * The per-host serialisation point (ADR-0002 §2). This is the FAST path, not
+ * the guarantee: if it misbehaves the worst outcome is a wasted API call or a
+ * 409, because `slot_locks` is what actually protects the calendar.
+ */
+export interface HostCoordinator {
+  book(hostUserId: string, request: BookingAttempt): Promise<BookingOutcome>
+  hold(hostUserId: string, request: HoldRequest): Promise<{ holdId: string; expiresAt: number } | null>
+  releaseHold(hostUserId: string, holdId: string): Promise<void>
+  /** Collective bookings acquire in ascending host id order — ordering is what makes deadlock impossible. */
+  lease(hostUserIds: string[], ttlMs: number): Promise<{ leaseId: string } | null>
+  releaseLease(hostUserIds: string[], leaseId: string): Promise<void>
+}
+
+export interface HoldRequest {
+  eventTypeId: string
+  /**
+   * For round-robin this is the provisional pick, not a commitment: an
+   * abandoned form must not skew the rotation, so assignment still re-runs at
+   * commit (ADR-0004 §5).
+   */
+  hostUserIds: string[]
+  start: number
+  end: number
+  ttlMs: number
+}
+
+export interface BookingAttempt {
+  eventTypeId: string
+  hostUserIds: string[]
+  start: number
+  end: number
+  guestName: string
+  guestEmail: string
+  additionalGuests?: string[]
+  guestTimezone: string
+  answers: Record<string, string>
+  idempotencyKey?: string
+  holdId?: string
+  rescheduleOf?: string
+}
+
+export type BookingOutcome =
+  /**
+   * `manageToken` is the RAW signed token, returned exactly once so the
+   * confirmation page and email can link to it. Only its hash is stored.
+   *
+   * Absent on an idempotent replay: the original raw token was never kept, so
+   * a retry can confirm the booking exists but cannot re-issue its link.
+   */
+  | { ok: true; booking: Booking; manageToken?: string }
+  | { ok: false; reason: 'slot_taken' | 'outside_availability' | 'policy' | 'lease_failed'; detail?: string }
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+/**
+ * Abuse limits, not plan quotas (ADR-0006 §3). Uniform for every deployment,
+ * generous enough that no legitimate team meets them, and raisable by the
+ * operator who owns the deployment. That is what keeps this from being the
+ * gating port ADR-0003 §4 refuses.
+ */
+export interface RateLimiter {
+  check(scope: string, identifier: string, limit: number, windowSeconds: number): Promise<RateLimitResult>
+}
+
+export interface RateLimitResult {
+  allowed: boolean
+  remaining: number
+  resetAt: number
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/**
+ * The email path in effect. Provider names are not secrets (the KEYS are), so
+ * this is safe to expose on `/health` for external monitoring.
+ */
+export type EmailDelivery = 'cloudflare' | 'resend' | 'brevo' | 'console'
+
+export interface EngineConfig {
+  /** Public origin, e.g. https://calendar.example — used in links and .ics URLs. */
+  baseUrl: string
+  brandName: string
+  /**
+   * The legal entity operating this deployment, named on /privacy and /terms
+   * as the data controller. Defaults to `brandName` when unset — correct for
+   * nobody in particular, which is the point: a self-hoster who deploys the
+   * public engine without setting this gets an honest "we didn't ask you who
+   * you are" default instead of another operator's company name.
+   */
+  legalOperator?: string
+  /**
+   * A real, live booking page on THIS deployment, e.g. `/serge/30min` —
+   * shown on the landing page as "see a booking page" and embedded live in
+   * the hero. Unset by default: a fresh deployment (self-hosted or a first
+   * boot) has no host/event type seeded yet, and a hardcoded path here would
+   * make every such deployment's own homepage embed a 404ing iframe.
+   */
+  demoBookingPath?: string
+  supportEmail: string
+  fromEmail: string
+  fromName: string
+  /**
+   * Which email path this deployment actually resolved to at boot.
+   *
+   * `'console'` means NO provider key was set, so `createConsoleSender` is in
+   * use and every confirmation, reschedule, cancellation and reminder is
+   * written to the log instead of delivered. That fallback is deliberate —
+   * it is what lets a self-hoster have a working product on day one — but it
+   * is indistinguishable from a healthy deployment from the outside, which
+   * is exactly how one real instance took nine bookings over a week while
+   * silently mailing nobody. Recording the resolved mode here is what lets
+   * `/health` and the dashboard SAY so, rather than leaving it to whoever
+   * happens to read the logs.
+   */
+  emailDelivery: EmailDelivery
+  /**
+   * The operator named a provider (EMAIL_PROVIDER) that could not be used —
+   * its key or binding is missing, or the name is unknown — in one
+   * sentence, for /health and the dashboard. Absent when all is well.
+   */
+  emailProblem?: string
+  /** Off unless explicitly enabled (ADR-0006 §5). */
+  protocolNamespace?: string
+  invitationUidDomain?: string
+  telemetryUrl?: string
+  telemetryEnabled: boolean
+  /** Abuse-limit overrides; operator-tunable. */
+  rateLimits?: Partial<Record<string, { limit: number; windowSeconds: number }>>
+  /** Who may create an account here — see `SignupPolicy`. Unset = open. */
+  signupPolicy?: SignupPolicy
+  /**
+   * A GA4 measurement id (`G-XXXXXXXXXX`), loaded ONLY on the marketing/docs
+   * pages (landing, /calendly-alternative, /docs and its sub-pages) — never
+   * on a booking page or the dashboard. Those carry a guest's or a host's
+   * real activity and are session-free by design (ADR-0005 §5); this
+   * deployment's own marketing analytics has no business seeing that.
+   * Unset by default: a self-hosted deployment gets no third-party script
+   * injected, and never one pointed at this project's own GA property.
+   */
+  analyticsId?: string
+}
+
+// ---------------------------------------------------------------------------
+// The composition root's input
+// ---------------------------------------------------------------------------
+
+export interface EnginePorts {
+  /** Per-request, because the D1 session is per-request (ADR-0007 §1). */
+  repositories: (ctx: RequestScope) => Repositories
+  calendars: CalendarProviders
+  oauth: OAuthCredentials
+  email: EmailSender
+  crypto: Crypto
+  cache: Cache
+  blobCache: BlobCache
+  blobStorage?: BlobStorage
+  clock: Clock
+  queue: QueuePort
+  coordinator: HostCoordinator
+  rateLimiter: RateLimiter
+  /** Page and confirm views for the Insights page; absent on a deployment without the binding. */
+  insights?: InsightsPort
+  /** The zone's edge traffic for the Admin page (adapters/insights/zone-analytics.ts); absent when not configured. */
+  zoneAnalytics?: { configured: boolean; traffic(): Promise<import('./adapters/insights/zone-analytics.js').ZoneTraffic | null> }
+  config: EngineConfig
+}
+
+/**
+ * What the adapter needs to pick a consistency mode (ADR-0007 §2).
+ *
+ * `unconstrained` — the public booking page. Reads the nearest replica and
+ * accepts its freshness, because `slot_locks` plus the DO re-check arbitrate at
+ * commit, so staleness degrades to a 409 rather than a wrong calendar. This is
+ * the surface whose latency IS the product claim.
+ *
+ * `bookmark` — the host dashboard and the commit path. A host must never read
+ * a replica older than their own last write.
+ */
+export interface RequestScope {
+  consistency: 'unconstrained' | 'bookmark'
+  bookmark?: string | null
+}
+
+/**
+ * Where the funnel's views go and come from (core/domain/insights.ts). The
+ * production adapter is Workers Analytics Engine (adapters/insights).
+ */
+export interface InsightsPort {
+  /** Views are being recorded at all. */
+  enabled: boolean
+  /** Views can be read back (an API token is configured). */
+  canRead: boolean
+  /** Fire-and-forget: a metric must never slow or fail a page. */
+  record(event: InsightEvent): void
+  /** Null when views cannot be read: not configured, or the read failed. */
+  query(eventTypeIds: string[], period: InsightsPeriod): Promise<InsightsViews | null>
+}

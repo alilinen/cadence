@@ -1,0 +1,1786 @@
+/// <reference types="@cloudflare/vitest-plugin" />
+
+/**
+ * The REST API, the MCP server and the embed widget, under the real Workers
+ * runtime (vitest.config.ts project `workers`).
+ *
+ * These cannot be plain-Node tests: the properties under test are the ones the
+ * runtime owns. Idempotency is arbitrated by a real D1 batch against a real
+ * unique index, and a fake `Repositories` that returned the same booking twice
+ * would prove only that the fake was written to agree with the test.
+ */
+
+import { beforeAll, describe, expect, it } from 'vitest'
+import { applyD1Migrations, env } from 'cloudflare:test'
+import { Hono } from 'hono'
+import { buildPorts, type Env } from '../../src/index.js'
+import { createSlotService } from '../../src/engine.js'
+import { buildApiRoutes, toInstant } from '../../src/http/api/rest.js'
+import { buildMcpRoutes } from '../../src/http/mcp/server.js'
+import { buildEmbedRoutes, embedScript } from '../../src/http/embed.js'
+import { buildRouter } from '../../src/http/router.js'
+import { createApiKey } from '../../src/core/domain/auth-flows.js'
+import { changeBookingHosts } from '../../src/core/domain/booking-hosts.js'
+import type { EnginePorts } from '../../src/ports.js'
+import type { EventType, User } from '../../src/core/domain/types.js'
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+/** Deterministic key material. Test keys, never near a deployment. */
+function keyMaterial(seed: number): string {
+  const bytes = new Uint8Array(32)
+  for (let i = 0; i < bytes.length; i++) bytes[i] = (seed * 31 + i * 7) & 0xff
+  let binary = ''
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!)
+  return btoa(binary)
+}
+
+/**
+ * The real `migrations/` directory, not a copy.
+ *
+ * A hand-maintained schema in the test file is a schema that drifts, and the
+ * drift shows up as a test suite that passes against a database no deployment
+ * has. Idempotent, so it costs nothing that `test/workers/setup.ts` also runs
+ * it — this file stays runnable on its own.
+ */
+beforeAll(async () => {
+  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS)
+})
+
+function testPorts(): EnginePorts {
+  return buildPorts({
+    ...env,
+    BASE_URL: 'https://cadence.test',
+    ENCRYPTION_KEY_V1: keyMaterial(1),
+    SIGNING_KEY: keyMaterial(9),
+  } as Env)
+}
+
+/** The engine's own mounting: the API at /api/v1, MCP at /mcp, embed at the root. */
+function buildApp(ports: EnginePorts): Hono {
+  const slots = createSlotService(ports)
+  const app = new Hono()
+  app.route('/api/v1', buildApiRoutes(ports, slots))
+  app.route('/mcp', buildMcpRoutes(ports, slots))
+  app.route('/', buildEmbedRoutes(ports))
+  return app
+}
+
+interface Seeded {
+  user: User
+  eventType: EventType
+  /** The raw `pk_…` key, which exists only at creation (ADR-0005 §7). */
+  apiKey: string
+}
+
+let seedCounter = 0
+
+/**
+ * A host who can actually be booked: availability, one event type, one key.
+ *
+ * Weekdays 09:00–17:00 UTC, so any window of a week contains bookable days
+ * without the test having to know today's date.
+ */
+async function seedHost(ports: EnginePorts, scopes: string[] = ['*']): Promise<Seeded> {
+  const n = ++seedCounter
+  const repos = ports.repositories({ consistency: 'bookmark' })
+  const user = await repos.users.create({
+    id: `usr_test_${n}`,
+    email: `host${n}@cadence.test`,
+    name: 'Test Host',
+    tz: 'UTC',
+    slug: `host${n}`,
+    avatarKey: null,
+    company: null,
+    jobTitle: null,
+    companyUrl: null,
+    role: 'member',
+  })
+  if (!user) throw new Error(`seedHost: slug host${n} unexpectedly collided`)
+
+  const workday = [{ startMinute: 9 * 60, endMinute: 17 * 60 }]
+  await repos.availability.create(user.id, {
+    id: `sch_test_${n}`,
+    userId: user.id,
+    name: 'Working hours',
+    isDefault: true,
+    timezone: 'UTC',
+    weekly: [[], workday, workday, workday, workday, workday, []],
+    overrides: [],
+  })
+
+  const eventType = await repos.eventTypes.create({
+    id: `evt_test_${n}`,
+    ownerUserId: user.id,
+    ownerTeamId: null,
+    schedulingType: 'personal',
+    slug: '30min',
+    title: 'Thirty minutes',
+    description: 'A test event type',
+    durationMinutes: 30,
+    slotIntervalMinutes: null,
+    bufferBeforeMinutes: 0,
+    bufferAfterMinutes: 0,
+    minNoticeMinutes: 0,
+    maxHorizonDays: 60,
+    maxPerDay: null,
+    locationType: 'custom_link',
+    locationValue: 'https://meet.cadence.test/room',
+    questions: [],
+    active: true,
+    scheduleId: null,
+  })
+
+  const { raw } = await createApiKey(
+    { repos, crypto: ports.crypto },
+    { userId: user.id, name: 'test key', scopes, now: Date.now() },
+  )
+
+  return { user, eventType, apiKey: raw }
+}
+
+function auth(key: string): Record<string, string> {
+  return { authorization: `Bearer ${key}` }
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/** A window starting tomorrow, so "now" never lands mid-slot or past notice. */
+function nextWeek(): { from: string; to: string } {
+  const from = Date.now() + DAY_MS
+  return { from: String(from), to: String(from + 7 * DAY_MS) }
+}
+
+interface SlotJson {
+  start: { iso: string; epochMs: number }
+  end: { iso: string; epochMs: number }
+  localDate: string
+  localTime: string
+  eligibleHostIds: string[]
+}
+
+async function firstSlot(app: Hono, key: string, eventTypeId: string): Promise<SlotJson> {
+  const { from, to } = nextWeek()
+  const res = await app.request(
+    `/api/v1/slots?eventTypeId=${eventTypeId}&from=${from}&to=${to}`,
+    { headers: auth(key) },
+  )
+  expect(res.status).toBe(200)
+  const body = (await res.json()) as { data: SlotJson[] }
+  expect(body.data.length).toBeGreaterThan(0)
+  return body.data[0]!
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+describe('API key authentication', () => {
+  it('rejects a request with no Authorization header', async () => {
+    const app = buildApp(testPorts())
+    const res = await app.request('/api/v1/event-types')
+
+    expect(res.status).toBe(401)
+    expect(res.headers.get('content-type')).toContain('application/problem+json')
+    expect(res.headers.get('www-authenticate')).toContain('Bearer')
+    const body = (await res.json()) as Record<string, unknown>
+    expect(body['status']).toBe(401)
+    expect(body['title']).toBe('Unauthorized')
+  })
+
+  it('rejects a malformed key without touching the database', async () => {
+    const app = buildApp(testPorts())
+    const res = await app.request('/api/v1/event-types', { headers: auth('not-a-key') })
+    expect(res.status).toBe(401)
+  })
+
+  it('rejects a well-formed key that does not exist', async () => {
+    const app = buildApp(testPorts())
+    const res = await app.request('/api/v1/event-types', {
+      headers: auth('pk_abcdefgh_deadbeefdeadbeefdeadbeef'),
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('refuses a write to a read-only key', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports, ['read'])
+
+    const res = await app.request('/api/v1/event-types', {
+      method: 'POST',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ slug: 'nope', title: 'Nope', durationMinutes: 30 }),
+    })
+    expect(res.status).toBe(403)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Event types
+// ---------------------------------------------------------------------------
+
+describe('event types', () => {
+  it('lists the key owner’s event types', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const res = await app.request('/api/v1/event-types', { headers: auth(seed.apiKey) })
+    expect(res.status).toBe(200)
+
+    const body = (await res.json()) as { data: Array<Record<string, unknown>> }
+    expect(body.data).toHaveLength(1)
+    expect(body.data[0]!['id']).toBe(seed.eventType.id)
+    expect(body.data[0]!['url']).toBe(`https://cadence.test/${seed.user.slug}/30min`)
+  })
+
+  it('a plain team member can read a team event type but not change it; an admin can', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const admin = await seedHost(ports)
+    const member = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+
+    const team = await repos.teams.createWithFirstMember(
+      { id: 'team_api_roles', name: 'API Roles Team', slug: 'api-roles-team', logoKey: null },
+      { userId: admin.user.id, role: 'admin', rrWeight: 1 },
+    )
+    await repos.teams.addMember({ teamId: team!.id, userId: member.user.id, role: 'member', rrWeight: 1 })
+    await repos.eventTypes.create({
+      ...admin.eventType,
+      id: 'evt_team_roles',
+      ownerUserId: null,
+      ownerTeamId: team!.id,
+      schedulingType: 'round_robin',
+      slug: 'roles-call',
+      scheduleId: null,
+    })
+
+    // Reading and listing: every member's.
+    const read = await app.request('/api/v1/event-types/evt_team_roles', { headers: auth(member.apiKey) })
+    expect(read.status).toBe(200)
+
+    // Changing: admins only, and the refusal says so rather than hiding the row.
+    const patch = (key: string) =>
+      app.request('/api/v1/event-types/evt_team_roles', {
+        method: 'PATCH',
+        headers: { ...auth(key), 'content-type': 'application/json' },
+        body: JSON.stringify({ title: 'Renamed' }),
+      })
+    const refused = await patch(member.apiKey)
+    expect(refused.status).toBe(403)
+    expect(((await refused.json()) as { detail: string }).detail).toContain('admin of the team')
+    expect((await repos.eventTypes.byId('evt_team_roles'))?.title).toBe(admin.eventType.title)
+
+    const del = await app.request('/api/v1/event-types/evt_team_roles', { method: 'DELETE', headers: auth(member.apiKey) })
+    expect(del.status).toBe(403)
+
+    const allowed = await patch(admin.apiKey)
+    expect(allowed.status).toBe(200)
+    expect((await repos.eventTypes.byId('evt_team_roles'))?.title).toBe('Renamed')
+  })
+
+  it('lists team-owned event types too, with the TEAM slug in the URL', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+
+    // `listForUser` selects WHERE owner_user_id = ?, which a team-owned row
+    // never matches (owner_team_id is set instead) — without also walking
+    // the caller's memberships, a team event type is invisible to the list
+    // endpoint even though get/patch/delete already authorize it by id.
+    const team = await repos.teams.createWithFirstMember(
+      { id: 'team_api_test', name: 'API Test Team', slug: 'api-test-team', logoKey: null },
+      { userId: seed.user.id, role: 'admin', rrWeight: 1 },
+    )
+    await repos.eventTypes.create({
+      id: 'evt_team_test',
+      ownerUserId: null,
+      ownerTeamId: team!.id,
+      schedulingType: 'round_robin',
+      slug: 'team-call',
+      title: 'Team call',
+      description: '',
+      durationMinutes: 30,
+      slotIntervalMinutes: null,
+      bufferBeforeMinutes: 0,
+      bufferAfterMinutes: 0,
+      minNoticeMinutes: 0,
+      maxHorizonDays: 60,
+      maxPerDay: null,
+      locationType: 'custom_link',
+      locationValue: null,
+      questions: [],
+      active: true,
+      scheduleId: null,
+    })
+
+    const res = await app.request('/api/v1/event-types', { headers: auth(seed.apiKey) })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: Array<Record<string, unknown>> }
+    expect(body.data).toHaveLength(2)
+    const teamEvent = body.data.find((d) => d['id'] === 'evt_team_test')
+    expect(teamEvent?.['url']).toBe('https://cadence.test/api-test-team/team-call')
+  })
+
+  it('returns problem JSON with field errors on an invalid body', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const res = await app.request('/api/v1/event-types', {
+      method: 'POST',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      // 7 minutes cannot exist on the 5-minute bucket grid (ADR-0002 §1), and
+      // the slug is not a slug.
+      body: JSON.stringify({ slug: 'Not A Slug', title: '', durationMinutes: 7 }),
+    })
+
+    expect(res.status).toBe(400)
+    expect(res.headers.get('content-type')).toContain('application/problem+json')
+    const body = (await res.json()) as {
+      type: string
+      title: string
+      status: number
+      detail: string
+      errors: Array<{ field: string; message: string }>
+    }
+    expect(body.type).toMatch(/^urn:cadence:problem:/)
+    expect(body.title).toBe('Invalid request')
+    expect(body.status).toBe(400)
+    expect(typeof body.detail).toBe('string')
+    expect(body.errors.map((e) => e.field).sort()).toEqual(['durationMinutes', 'slug', 'title'])
+  })
+
+  it('creates, patches and deletes on a bookmarked session', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const headers = { ...auth(seed.apiKey), 'content-type': 'application/json' }
+
+    const created = await app.request('/api/v1/event-types', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        slug: 'intro',
+        title: 'Intro call',
+        description: 'Fifteen minutes to say hello',
+        durationMinutes: 15,
+        bufferAfterMinutes: 10,
+        minNoticeMinutes: 120,
+      }),
+    })
+    expect(created.status).toBe(201)
+    const createdBody = (await created.json()) as { data: { id: string; locationType: string } }
+    expect(createdBody.data.locationType).toBe('custom_link')
+    const unavailable = await app.request(`/api/v1/event-types/${createdBody.data.id}`, {
+      method: 'PATCH', headers, body: JSON.stringify({ locationType: 'google_meet' }),
+    })
+    expect(unavailable.status).toBe(400)
+
+    const patched = await app.request(`/api/v1/event-types/${createdBody.data.id}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ title: 'Intro chat' }),
+    })
+    expect(patched.status).toBe(200)
+    // The response is a read-after-write: it must show the stored row, not the
+    // patch echoed back (ADR-0007 §2).
+    const patchedBody = (await patched.json()) as {
+      data: { title: string; description: string; bufferAfterMinutes: number; minNoticeMinutes: number }
+    }
+    expect(patchedBody.data.title).toBe('Intro chat')
+    // A PATCH names what changes. Fields it does not name must survive it —
+    // the failure mode being guarded is a schema whose absent keys quietly
+    // materialise their defaults and wipe the host's settings.
+    expect(patchedBody.data.description).toBe('Fifteen minutes to say hello')
+    expect(patchedBody.data.bufferAfterMinutes).toBe(10)
+    expect(patchedBody.data.minNoticeMinutes).toBe(120)
+
+    const deleted = await app.request(`/api/v1/event-types/${createdBody.data.id}`, {
+      method: 'DELETE',
+      headers: auth(seed.apiKey),
+    })
+    expect(deleted.status).toBe(204)
+
+    const gone = await app.request(`/api/v1/event-types/${createdBody.data.id}`, {
+      headers: auth(seed.apiKey),
+    })
+    expect(gone.status).toBe(404)
+  })
+
+  it('answers 404 rather than 403 for someone else’s event type', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const mine = await seedHost(ports)
+    const theirs = await seedHost(ports)
+
+    const res = await app.request(`/api/v1/event-types/${theirs.eventType.id}`, {
+      headers: auth(mine.apiKey),
+    })
+    expect(res.status).toBe(404)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Availability and slots
+// ---------------------------------------------------------------------------
+
+describe('availability', () => {
+  it('round-trips a weekly schedule', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const put = await app.request('/api/v1/availability', {
+      method: 'PUT',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        timezone: 'Europe/Kyiv',
+        weekly: [[], [{ startMinute: 600, endMinute: 1080 }], [], [], [], [], []],
+        overrides: [{ date: '2026-12-24', windows: [] }],
+      }),
+    })
+    expect(put.status).toBe(200)
+
+    const get = await app.request('/api/v1/availability', { headers: auth(seed.apiKey) })
+    const body = (await get.json()) as { data: { timezone: string; weekly: unknown[][] } }
+    expect(body.data.timezone).toBe('Europe/Kyiv')
+    expect(body.data.weekly[1]).toHaveLength(1)
+  })
+
+  it('rejects an unknown timezone with problem JSON', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const res = await app.request('/api/v1/availability', {
+      method: 'PUT',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ timezone: 'Mars/Olympus', weekly: [[], [], [], [], [], [], []] }),
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { errors: Array<{ field: string }> }
+    expect(body.errors[0]!.field).toBe('timezone')
+  })
+})
+
+describe('GET /slots', () => {
+  it('returns bookable slots inside the host’s working hours', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const { from, to } = nextWeek()
+    const res = await app.request(
+      `/api/v1/slots?eventTypeId=${seed.eventType.id}&from=${from}&to=${to}&tz=Europe/Berlin`,
+      { headers: auth(seed.apiKey) },
+    )
+
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: SlotJson[]; meta: { timezone: string } }
+    expect(body.meta.timezone).toBe('Europe/Berlin')
+    expect(body.data.length).toBeGreaterThan(0)
+
+    const slot = body.data[0]!
+    expect(slot.end.epochMs - slot.start.epochMs).toBe(30 * 60_000)
+    expect(slot.eligibleHostIds).toEqual([seed.user.id])
+  })
+
+  /**
+   * An event type assigned a specific schedule must draw its slots
+   * from THAT schedule's hours, not the host's default — and reverting the
+   * assignment (scheduleId back to null) must fall back to the default
+   * again. `seedHost`'s default schedule is 09:00-17:00 UTC weekdays; this
+   * schedule is a disjoint 20:00-21:00 UTC every day, so the two can never
+   * accidentally overlap and produce a false pass.
+   */
+  it('draws slots from the assigned schedule, not the default', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+
+    const evening = [{ startMinute: 20 * 60, endMinute: 21 * 60 }]
+    await repos.availability.create(seed.user.id, {
+      id: `sch_evening_${seed.user.id}`,
+      userId: seed.user.id,
+      name: 'Evenings',
+      isDefault: false,
+      timezone: 'UTC',
+      weekly: [evening, evening, evening, evening, evening, evening, evening],
+      overrides: [],
+    })
+
+    const patchRes = await app.request(`/api/v1/event-types/${seed.eventType.id}`, {
+      method: 'PATCH',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ scheduleId: `sch_evening_${seed.user.id}` }),
+    })
+    expect(patchRes.status).toBe(200)
+    expect((await patchRes.json() as { data: { scheduleId: string | null } }).data.scheduleId).toBe(
+      `sch_evening_${seed.user.id}`,
+    )
+
+    const { from, to } = nextWeek()
+    const assigned = await app.request(
+      `/api/v1/slots?eventTypeId=${seed.eventType.id}&from=${from}&to=${to}`,
+      { headers: auth(seed.apiKey) },
+    )
+    const assignedBody = (await assigned.json()) as { data: SlotJson[] }
+    expect(assignedBody.data.length).toBeGreaterThan(0)
+    for (const slot of assignedBody.data) {
+      expect(new Date(slot.start.epochMs).getUTCHours()).toBe(20)
+    }
+
+    // Revert to the default — falls back to the 09:00-17:00 schedule again.
+    await app.request(`/api/v1/event-types/${seed.eventType.id}`, {
+      method: 'PATCH',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ scheduleId: null }),
+    })
+    const reverted = await app.request(
+      `/api/v1/slots?eventTypeId=${seed.eventType.id}&from=${from}&to=${to}`,
+      { headers: auth(seed.apiKey) },
+    )
+    const revertedBody = (await reverted.json()) as { data: SlotJson[] }
+    expect(revertedBody.data.length).toBeGreaterThan(0)
+    for (const slot of revertedBody.data) {
+      const hour = new Date(slot.start.epochMs).getUTCHours()
+      expect(hour).toBeGreaterThanOrEqual(9)
+      expect(hour).toBeLessThan(17)
+    }
+  })
+
+  it('refuses an unbounded range', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const from = Date.now()
+    const res = await app.request(
+      `/api/v1/slots?eventTypeId=${seed.eventType.id}&from=${from}&to=${from + 400 * DAY_MS}`,
+      { headers: auth(seed.apiKey) },
+    )
+    expect(res.status).toBe(400)
+    expect((await res.json() as { title: string }).title).toBe('Range too large')
+  })
+
+  /**
+   * Regression: a listing must not offer a start whose BUFFER reaches busy
+   * time sitting just outside the queried `from`/`to`.
+   *
+   * `computeSlots` grids each availability window at its own unclipped
+   * boundary and only filters candidate STARTS to the query range afterward
+   * — so a candidate's buffered footprint can legitimately extend outside
+   * the range while the start itself stays inside it. If busy data were
+   * only loaded for the bare query range, a slot could be advertised as
+   * bookable and then deterministically 409 at commit, because the conflict
+   * sat just before `from` and was never fetched.
+   */
+  it('does not offer a start whose buffer overlaps busy time just before the query range', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    // 30-minute buffer before every booking.
+    const patchRes = await app.request(`/api/v1/event-types/${seed.eventType.id}`, {
+      method: 'PATCH',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ bufferBeforeMinutes: 30 }),
+    })
+    expect(patchRes.status).toBe(200)
+
+    // An overnight availability window, built the same way as the slot-grid
+    // regression test: two adjacent UTC-date overrides that touch at
+    // midnight and merge into one continuous 22:00->06:00 free window.
+    const midnight = Math.floor((Date.now() + 3 * DAY_MS) / DAY_MS) * DAY_MS
+    const dateStr = (ms: number) => new Date(ms).toISOString().slice(0, 10)
+    const dayBefore = dateStr(midnight - DAY_MS)
+    const dayOf = dateStr(midnight)
+
+    const repos = ports.repositories({ consistency: 'bookmark' })
+    const defaultSchedule = await repos.availability.forUser(seed.user.id)
+    await repos.availability.update(seed.user.id, defaultSchedule!.id, {
+      timezone: 'UTC',
+      weekly: [[], [], [], [], [], [], []],
+      overrides: [
+        { date: dayBefore, windows: [{ startMinute: 22 * 60, endMinute: 24 * 60 }] },
+        { date: dayOf, windows: [{ startMinute: 0, endMinute: 6 * 60 }] },
+      ],
+    })
+
+    // A real lock at 23:45-23:50 the day before — inside the 22:00->06:00
+    // window, 15 minutes before the query range's `from`, and inside the
+    // 30-minute buffer reach of a candidate starting exactly at midnight.
+    await env.DB.prepare(
+      'INSERT INTO slot_locks (host_user_id,bucket_start,booking_id) VALUES (?,?,?)',
+    )
+      .bind(seed.user.id, midnight - 15 * 60_000, 'bk_seed_conflict')
+      .run()
+
+    const res = await app.request(
+      `/api/v1/slots?eventTypeId=${seed.eventType.id}&from=${midnight}&to=${midnight + 60 * 60_000}`,
+      { headers: auth(seed.apiKey) },
+    )
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: SlotJson[] }
+    const starts = body.data.map((s) => s.start.epochMs)
+
+    // The 00:00 candidate's buffer (23:30->00:00) overlaps the 23:45-23:50
+    // lock — must NOT be offered, which requires the lock to have been
+    // loaded at all (Fix 2's busyRange widening).
+    //
+    // The grid itself is walked on the window's raw, busy-agnostic 22:00
+    // start regardless of the lock (30-minute steps: 22:00, 22:30, ...,
+    // 23:30, 00:00, 00:30, 01:00, ...) — busy time is applied afterward as a
+    // pure per-candidate footprint filter, never by re-splitting the window
+    // and re-anchoring at the lock's edge. So 00:20 (an anchor that only
+    // exists if the window is re-split at the lock) is never even a
+    // candidate; 00:00 is a candidate but is filtered out for colliding with
+    // the lock, and 00:30 is unaffected (footprint 00:00->01:00 clears the
+    // 23:45-23:50 lock) and stays offered.
+    expect(starts).not.toContain(midnight)
+    // A later candidate on the busy-agnostic grid — still offered, so this
+    // isn't just the whole window going empty.
+    expect(starts).toContain(midnight + 30 * 60_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Bookings
+// ---------------------------------------------------------------------------
+
+describe('collective event types with an explicit host set', () => {
+  it('draws slots from each host\'s per-event schedule, and commits with the optional hosts that are free', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const admin = await seedHost(ports)
+    const helper = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+
+    const team = await repos.teams.createWithFirstMember(
+      { id: 'team_api_hosts', name: 'Hosts Team', slug: 'hosts-team', logoKey: null },
+      { userId: admin.user.id, role: 'admin', rrWeight: 1 },
+    )
+    await repos.teams.addMember({ teamId: team!.id, userId: helper.user.id, role: 'member', rrWeight: 1 })
+    await repos.eventTypes.create({
+      ...admin.eventType,
+      id: 'evt_hosts_collective',
+      ownerUserId: null,
+      ownerTeamId: team!.id,
+      schedulingType: 'collective',
+      slug: 'support',
+      scheduleId: null,
+    })
+    // The admin hosts this one on afternoons only; the helper is optional.
+    const afternoon = [{ startMinute: 13 * 60, endMinute: 17 * 60 }]
+    await repos.availability.create(admin.user.id, {
+      id: 'sch_admin_afternoons',
+      userId: admin.user.id,
+      name: 'Afternoons',
+      isDefault: false,
+      timezone: 'UTC',
+      weekly: [[], afternoon, afternoon, afternoon, afternoon, afternoon, []],
+      overrides: [],
+    })
+    expect(
+      await repos.eventTypeHosts.replace('evt_hosts_collective', [
+        { userId: admin.user.id, required: true, scheduleId: 'sch_admin_afternoons', rrWeight: null },
+        { userId: helper.user.id, required: false, scheduleId: null, rrWeight: null },
+      ]),
+    ).toBe(true)
+
+    const { from, to } = nextWeek()
+    const listed = await app.request(`/api/v1/slots?eventTypeId=evt_hosts_collective&from=${from}&to=${to}&tz=UTC`, {
+      headers: auth(admin.apiKey),
+    })
+    expect(listed.status).toBe(200)
+    const slots = ((await listed.json()) as { data: SlotJson[] }).data
+    expect(slots.length).toBeGreaterThan(0)
+    // Every slot sits inside the admin's afternoon schedule, not the 09:00 default...
+    expect(slots.every((s) => new Date(s.start.epochMs).getUTCHours() >= 13)).toBe(true)
+    // ...and both hosts are named while both are free.
+    expect(slots[0]!.eligibleHostIds.sort()).toEqual([admin.user.id, helper.user.id].sort())
+
+    // Make the helper busy at the first slot via their own personal event type.
+    const first = slots[0]!
+    const personal = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers: { ...auth(helper.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        eventTypeId: helper.eventType.id,
+        start: first.start.iso,
+        guestName: 'Other Guest',
+        guestEmail: 'other@example.com',
+        guestTimezone: 'UTC',
+      }),
+    })
+    expect(personal.status).toBe(201)
+
+    // The collective slot is still on offer (the helper is optional), now naming only the admin.
+    const relisted = await app.request(`/api/v1/slots?eventTypeId=evt_hosts_collective&from=${from}&to=${to}&tz=UTC`, {
+      headers: auth(admin.apiKey),
+    })
+    const again = ((await relisted.json()) as { data: SlotJson[] }).data
+    const same = again.find((s) => s.start.epochMs === first.start.epochMs)
+    expect(same?.eligibleHostIds).toEqual([admin.user.id])
+
+    const booked = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers: { ...auth(admin.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        eventTypeId: 'evt_hosts_collective',
+        start: first.start.iso,
+        guestName: 'Ada Lovelace',
+        guestEmail: 'ada@example.com',
+        guestTimezone: 'UTC',
+      }),
+    })
+    expect(booked.status).toBe(201)
+    const id = ((await booked.json()) as { data: { id: string } }).data.id
+    const stored = await repos.bookings.byId(id)
+    expect(stored?.hostUserIds).toEqual([admin.user.id])
+
+    // A later slot, with the helper free again, commits with both.
+    const later = again.find((s) => s.start.epochMs > first.start.epochMs + 3_600_000 && s.eligibleHostIds.length === 2)!
+    const both = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers: { ...auth(admin.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        eventTypeId: 'evt_hosts_collective',
+        start: later.start.iso,
+        guestName: 'Grace Hopper',
+        guestEmail: 'grace@example.com',
+        guestTimezone: 'UTC',
+      }),
+    })
+    expect(both.status).toBe(201)
+    const bothId = ((await both.json()) as { data: { id: string } }).data.id
+    expect((await repos.bookings.byId(bothId))?.hostUserIds.sort()).toEqual([admin.user.id, helper.user.id].sort())
+  })
+})
+
+describe('team event types through the API', () => {
+  async function team(ports: EnginePorts) {
+    const admin = await seedHost(ports)
+    const member = await seedHost(ports)
+    const outsider = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+    const id = `team_api_${admin.user.id}`
+    const created = await repos.teams.createWithFirstMember(
+      { id, name: 'API Crew', slug: `api-crew-${admin.user.id}`, logoKey: null },
+      { userId: admin.user.id, role: 'admin', rrWeight: 1 },
+    )
+    await repos.teams.addMember({ teamId: id, userId: member.user.id, role: 'member', rrWeight: 2 })
+    return { admin, member, outsider, repos, team: created! }
+  }
+  const json = (key: string, body: unknown) => ({
+    headers: { ...auth(key), 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+
+  it('an admin creates a team event type with an explicit host set; the response lists the hosts', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const t = await team(ports)
+
+    const res = await app.request('/api/v1/event-types', {
+      method: 'POST',
+      ...json(t.admin.apiKey, {
+        title: 'Crew call',
+        slug: 'crew-call',
+        durationMinutes: 30,
+        ownerTeamId: t.team.id,
+        schedulingType: 'collective',
+        hosts: [
+          { userId: t.admin.user.id, required: true },
+          { userId: t.member.user.id, required: false, scheduleId: `sch_test_${t.member.user.id.split('_')[2]}` },
+        ],
+      }),
+    })
+    expect(res.status).toBe(201)
+    const body = (await res.json()) as { data: { id: string; url: string; ownerTeamId: string; schedulingType: string; hosts: Array<Record<string, unknown>> } }
+    expect(body.data.ownerTeamId).toBe(t.team.id)
+    expect(body.data.schedulingType).toBe('collective')
+    expect(body.data.url).toBe(`https://cadence.test/${t.team.slug}/crew-call`)
+    expect(body.data.hosts.map((h) => [h['userId'], h['required'], h['scheduleId']])).toEqual([
+      [t.admin.user.id, true, null],
+      [t.member.user.id, false, `sch_test_${t.member.user.id.split('_')[2]}`],
+    ])
+
+    // A personal event type lists its one host too.
+    const mine = await app.request(`/api/v1/event-types/${t.admin.eventType.id}`, { headers: auth(t.admin.apiKey) })
+    expect(((await mine.json()) as { data: { hosts: unknown[] } }).data.hosts).toHaveLength(1)
+  })
+
+  it('a member or outsider cannot create under the team; a bad host list is refused BEFORE anything is written', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const t = await team(ports)
+    const base = { title: 'X', slug: 'x', durationMinutes: 30, ownerTeamId: t.team.id }
+
+    expect((await app.request('/api/v1/event-types', { method: 'POST', ...json(t.member.apiKey, base) })).status).toBe(403)
+    expect((await app.request('/api/v1/event-types', { method: 'POST', ...json(t.outsider.apiKey, base) })).status).toBe(403)
+
+    // Not on the team: 400, and no event type left behind.
+    const bad = await app.request('/api/v1/event-types', {
+      method: 'POST',
+      ...json(t.admin.apiKey, { ...base, hosts: [{ userId: t.outsider.user.id }] }),
+    })
+    expect(bad.status).toBe(400)
+    expect((await t.repos.eventTypes.listForTeam(t.team.id)).some((et) => et.slug === 'x')).toBe(false)
+
+    // A collective with no required host would never offer a slot: refused, on create and on patch.
+    const allOptional = await app.request('/api/v1/event-types', {
+      method: 'POST',
+      ...json(t.admin.apiKey, { ...base, schedulingType: 'collective', hosts: [{ userId: t.member.user.id, required: false }] }),
+    })
+    expect(allOptional.status).toBe(400)
+    expect(((await allOptional.json()) as { detail: string }).detail).toContain('at least one required host')
+    await t.repos.eventTypes.create({ ...t.admin.eventType, id: 'evt_api_coll', ownerUserId: null, ownerTeamId: t.team.id, schedulingType: 'collective', slug: 'coll', scheduleId: null })
+    const patchBad = await app.request('/api/v1/event-types/evt_api_coll', {
+      method: 'PATCH',
+      ...json(t.admin.apiKey, { title: 'Renamed', hosts: [{ userId: t.member.user.id, required: false }] }),
+    })
+    expect(patchBad.status).toBe(400)
+    // Rejected before any write: the title did not change either.
+    expect((await t.repos.eventTypes.byId('evt_api_coll'))?.title).toBe(t.admin.eventType.title)
+
+    // hosts on a personal event type is a 400.
+    const personal = await app.request('/api/v1/event-types', {
+      method: 'POST',
+      ...json(t.admin.apiKey, { title: 'P', slug: 'p', durationMinutes: 30, hosts: [{ userId: t.admin.user.id }] }),
+    })
+    expect(personal.status).toBe(400)
+  })
+
+  it('PATCH hosts replaces the set (admin only); a host sets their own schedule, a co-host cannot set another\'s', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const t = await team(ports)
+    await t.repos.eventTypes.create({ ...t.admin.eventType, id: 'evt_api_hosts', ownerUserId: null, ownerTeamId: t.team.id, schedulingType: 'round_robin', slug: 'rr', scheduleId: null })
+
+    const patched = await app.request('/api/v1/event-types/evt_api_hosts', {
+      method: 'PATCH',
+      ...json(t.admin.apiKey, { hosts: [{ userId: t.member.user.id, weight: 5 }] }),
+    })
+    expect(patched.status).toBe(200)
+    const hosts = ((await patched.json()) as { data: { hosts: Array<Record<string, unknown>> } }).data.hosts
+    expect(hosts.map((h) => [h['userId'], h['weight']])).toEqual([[t.member.user.id, 5]])
+
+    // The member's own key sets their per-event schedule.
+    const memberSchedule = `sch_test_${t.member.user.id.split('_')[2]}`
+    const own = await app.request(`/api/v1/event-types/evt_api_hosts/hosts/${t.member.user.id}`, {
+      method: 'PATCH',
+      ...json(t.member.apiKey, { scheduleId: memberSchedule }),
+    })
+    expect(own.status).toBe(200)
+    expect((await t.repos.eventTypeHosts.forEventType('evt_api_hosts'))[0]?.scheduleId).toBe(memberSchedule)
+
+    // The member cannot replace the host list, nor set the admin's schedule.
+    expect((await app.request('/api/v1/event-types/evt_api_hosts', { method: 'PATCH', ...json(t.member.apiKey, { hosts: [] }) })).status).toBe(403)
+    // Put the admin back on the set first, so the target exists.
+    await t.repos.eventTypeHosts.replace('evt_api_hosts', [
+      { userId: t.admin.user.id, required: true, scheduleId: null, rrWeight: null },
+      { userId: t.member.user.id, required: true, scheduleId: memberSchedule, rrWeight: 5 },
+    ])
+    const other = await app.request(`/api/v1/event-types/evt_api_hosts/hosts/${t.admin.user.id}`, {
+      method: 'PATCH',
+      ...json(t.member.apiKey, { scheduleId: null }),
+    })
+    expect(other.status).toBe(403)
+    expect(((await other.json()) as { detail: string }).detail).toContain('an admin of the team')
+    // The admin can set anyone's.
+    expect((await app.request(`/api/v1/event-types/evt_api_hosts/hosts/${t.member.user.id}`, { method: 'PATCH', ...json(t.admin.apiKey, { scheduleId: null }) })).status).toBe(200)
+  })
+
+  it('the instance admin reaches a team event type over the API without being on the team', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const t = await team(ports)
+    const root = await seedHost(ports)
+    await env.DB.prepare("UPDATE users SET role = 'admin' WHERE id = ?").bind(root.user.id).run()
+
+    const created = await app.request('/api/v1/event-types', {
+      method: 'POST',
+      ...json(root.apiKey, { title: 'Root made this', slug: 'root-made', durationMinutes: 30, ownerTeamId: t.team.id }),
+    })
+    expect(created.status).toBe(201)
+    const id = ((await created.json()) as { data: { id: string } }).data.id
+    expect((await app.request(`/api/v1/event-types/${id}`, { headers: auth(root.apiKey) })).status).toBe(200)
+    expect((await app.request(`/api/v1/event-types/${id}`, { method: 'PATCH', ...json(root.apiKey, { title: 'Renamed' }) })).status).toBe(200)
+    expect((await app.request(`/api/v1/event-types/${id}`, { method: 'DELETE', headers: auth(root.apiKey) })).status).toBe(204)
+  })
+
+  it('a host added over the API gets the same host-added email as one added on the dashboard', async () => {
+    const ports = testPorts()
+    const sent: Array<{ to: string; subject: string }> = []
+    ports.email = { async send(m) { sent.push({ to: m.to, subject: m.subject }) } }
+    const app = buildApp(ports)
+    const t = await team(ports)
+    await t.repos.eventTypes.create({ ...t.admin.eventType, id: 'evt_api_mail', ownerUserId: null, ownerTeamId: t.team.id, schedulingType: 'round_robin', slug: 'mail', scheduleId: null })
+    // Narrow to the admin alone, then add the member: only the member is new.
+    await t.repos.eventTypeHosts.replace('evt_api_mail', [{ userId: t.admin.user.id, required: true, scheduleId: null, rrWeight: null }])
+    const res = await app.request('/api/v1/event-types/evt_api_mail', {
+      method: 'PATCH',
+      ...json(t.admin.apiKey, { hosts: [{ userId: t.admin.user.id }, { userId: t.member.user.id }] }),
+    })
+    expect(res.status).toBe(200)
+    expect(sent).toEqual([{ to: t.member.user.email, subject: "You're a host on Thirty minutes" }])
+  })
+
+  it("a team admin's key manages a member's schedules; a member's key cannot", async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const t = await team(ports)
+    const path = `/api/v1/teams/${t.team.id}/members/${t.member.user.id}/schedules`
+    const workday = [{ startMinute: 13 * 60, endMinute: 17 * 60 }]
+    const schedule = { name: 'Afternoons', timezone: 'UTC', weekly: [[], workday, workday, workday, workday, workday, []], overrides: [] }
+
+    expect((await app.request(path, { headers: auth(t.member.apiKey) })).status).toBe(403)
+    expect((await app.request(path, { method: 'POST', ...json(t.member.apiKey, schedule) })).status).toBe(403)
+    expect((await app.request(path, { headers: auth(t.outsider.apiKey) })).status).toBe(403)
+
+    const created = await app.request(path, { method: 'POST', ...json(t.admin.apiKey, schedule) })
+    expect(created.status).toBe(201)
+    const made = ((await created.json()) as { data: { id: string; createdBy: string; name: string } }).data
+    expect(made.createdBy).toBe(t.admin.user.id)
+
+    const listed = await app.request(path, { headers: auth(t.admin.apiKey) })
+    const names = ((await listed.json()) as { data: Array<{ name: string }> }).data.map((sch) => sch.name)
+    expect(names).toContain('Afternoons')
+
+    // Give it a date override, then rename WITHOUT sending overrides: they must survive (review).
+    await t.repos.availability.update(t.member.user.id, made.id, { overrides: [{ date: '2026-12-24', windows: [] }] })
+    const renamed = await app.request(`${path}/${made.id}`, { method: 'PATCH', ...json(t.admin.apiKey, { name: 'Support hours' }) })
+    expect(renamed.status).toBe(200)
+    const after = await t.repos.availability.byId(t.member.user.id, made.id)
+    expect(after?.name).toBe('Support hours')
+    expect(after?.overrides).toEqual([{ date: '2026-12-24', windows: [] }])
+    // Not on the team → 404, not a hint that the user exists.
+    expect((await app.request(`/api/v1/teams/${t.team.id}/members/${t.outsider.user.id}/schedules`, { headers: auth(t.admin.apiKey) })).status).toBe(404)
+  })
+})
+
+describe('POST /bookings', () => {
+  it('validates public additional guests before booking, preserves the form, and persists normalized addresses', async () => {
+    const ports = testPorts()
+    const seed = await seedHost(ports)
+    const slot = await firstSlot(buildApp(ports), seed.apiKey, seed.eventType.id)
+    const app = buildRouter(ports, createSlotService(ports))
+    const body = { start: String(slot.start.epochMs), tz: 'UTC', name: 'Public Guest', email: 'public@example.com', q_agenda: 'Team walkthrough' }
+    const submit = (additionalGuests: string) => app.request(`/${seed.user.slug}/${seed.eventType.slug}/confirm`, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ...body, additionalGuests }),
+    })
+    const invalid = await submit('broken-address')
+    expect(invalid.status).toBe(400)
+    const html = await invalid.text()
+    expect(html).toContain('broken-address')
+    expect(html).toContain('Team walkthrough')
+    expect((await ports.repositories({ consistency: 'bookmark' }).bookings.listForHostByStatus(seed.user.id, { view: 'upcoming', now: Date.now(), limit: 10 }))).toHaveLength(0)
+    const valid = await submit('EXTRA@example.com, public@example.com, extra@example.com')
+    expect(valid.status).toBe(200)
+    const saved = await ports.repositories({ consistency: 'bookmark' }).bookings.listForHostByStatus(seed.user.id, { view: 'upcoming', now: Date.now(), limit: 10 })
+    expect(saved).toHaveLength(1)
+    expect(saved[0]!.additionalGuests).toEqual(['extra@example.com'])
+  })
+
+  it('books a slot and lists it back', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const slot = await firstSlot(app, seed.apiKey, seed.eventType.id)
+
+    const res = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        eventTypeId: seed.eventType.id,
+        start: slot.start.iso,
+        guestName: 'Ada Lovelace',
+        guestEmail: 'ada@example.com',
+        guestTimezone: 'Europe/London',
+      }),
+    })
+
+    expect(res.status).toBe(201)
+    const body = (await res.json()) as { data: { id: string; start: { epochMs: number }; status: string } }
+    expect(body.data.status).toBe('confirmed')
+    expect(body.data.start.epochMs).toBe(slot.start.epochMs)
+
+    const { from, to } = nextWeek()
+    const list = await app.request(`/api/v1/bookings?from=${from}&to=${to}`, { headers: auth(seed.apiKey) })
+    const listBody = (await list.json()) as { data: Array<{ id: string }> }
+    expect(listBody.data.map((b) => b.id)).toEqual([body.data.id])
+  })
+
+  /**
+   * Regression: the commit-time re-check (coordinator.ts's
+   * `buildHostInputs`, ADR-0002 §2) used to validate every booking against
+   * the host's DEFAULT schedule regardless of what the event type was
+   * assigned — so a guest booking a real, currently-listed slot on an
+   * assigned schedule got a false 409, while a time the assigned schedule
+   * never offered could still commit if it happened to fall inside the
+   * default. `seedHost`'s default is 09:00-17:00 UTC weekdays; this
+   * schedule is a disjoint 20:00-21:00 UTC every day, so a pass here can
+   * only mean the commit path is reading the assignment, not the default.
+   */
+  it('honors the event type\'s assigned schedule at commit, not just at listing', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+
+    const evening = [{ startMinute: 20 * 60, endMinute: 21 * 60 }]
+    const scheduleId = `sch_evening_commit_${seed.user.id}`
+    await repos.availability.create(seed.user.id, {
+      id: scheduleId,
+      userId: seed.user.id,
+      name: 'Evenings',
+      isDefault: false,
+      timezone: 'UTC',
+      weekly: [evening, evening, evening, evening, evening, evening, evening],
+      overrides: [],
+    })
+    await app.request(`/api/v1/event-types/${seed.eventType.id}`, {
+      method: 'PATCH',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ scheduleId }),
+    })
+
+    // A slot the LISTING already correctly offers under the assigned
+    // schedule (proven by the GET /slots test above) — booking it must
+    // actually commit, not 409 against the default it no longer uses.
+    const slot = await firstSlot(app, seed.apiKey, seed.eventType.id)
+    expect(new Date(slot.start.epochMs).getUTCHours()).toBe(20)
+    const bookRes = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        eventTypeId: seed.eventType.id,
+        start: slot.start.iso,
+        guestName: 'Ada Lovelace',
+        guestEmail: 'ada@example.com',
+      }),
+    })
+    expect(bookRes.status).toBe(201)
+
+    // A time inside the DEFAULT (10:00) but outside the assigned schedule
+    // must still be refused — proving the commit path isn't just "anything
+    // goes" once an assignment exists.
+    const tomorrow10am = Math.floor((Date.now() + DAY_MS) / DAY_MS) * DAY_MS + 10 * 60 * 60_000
+    const outsideRes = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        eventTypeId: seed.eventType.id,
+        start: new Date(tomorrow10am).toISOString(),
+        guestName: 'Bea Guest',
+        guestEmail: 'bea@example.com',
+      }),
+    })
+    expect(outsideRes.status).toBe(409)
+  })
+
+  it('returns the SAME booking for a repeated Idempotency-Key', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const slot = await firstSlot(app, seed.apiKey, seed.eventType.id)
+
+    const payload = JSON.stringify({
+      eventTypeId: seed.eventType.id,
+      start: slot.start.epochMs,
+      guestName: 'Grace Hopper',
+      guestEmail: 'grace@example.com',
+    })
+    const headers = {
+      ...auth(seed.apiKey),
+      'content-type': 'application/json',
+      'idempotency-key': 'retry-me-once',
+    }
+
+    const first = await app.request('/api/v1/bookings', { method: 'POST', headers, body: payload })
+    expect(first.status).toBe(201)
+    const firstBody = (await first.json()) as { data: { id: string } }
+
+    // The retry a flaky network produces: same key, same body. It must return
+    // the original booking rather than a second meeting at the same time
+    // (ADR-0002 §4) — and it must not 409 either, which is what a naive
+    // "already locked" implementation would do.
+    const second = await app.request('/api/v1/bookings', { method: 'POST', headers, body: payload })
+    expect(second.status).toBe(201)
+    const secondBody = (await second.json()) as { data: { id: string } }
+    expect(secondBody.data.id).toBe(firstBody.data.id)
+
+    const { from, to } = nextWeek()
+    const list = await app.request(`/api/v1/bookings?from=${from}&to=${to}`, { headers: auth(seed.apiKey) })
+    expect(((await list.json()) as { data: unknown[] }).data).toHaveLength(1)
+  })
+
+  it('409s when the slot is already taken by someone else', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const slot = await firstSlot(app, seed.apiKey, seed.eventType.id)
+    const headers = { ...auth(seed.apiKey), 'content-type': 'application/json' }
+
+    const body = (guest: string) =>
+      JSON.stringify({
+        eventTypeId: seed.eventType.id,
+        start: slot.start.epochMs,
+        guestName: guest,
+        guestEmail: `${guest}@example.com`,
+      })
+
+    expect((await app.request('/api/v1/bookings', { method: 'POST', headers, body: body('first') })).status).toBe(201)
+
+    const clash = await app.request('/api/v1/bookings', { method: 'POST', headers, body: body('second') })
+    expect(clash.status).toBe(409)
+    expect(clash.headers.get('content-type')).toContain('application/problem+json')
+  })
+
+  it('cancels a booking and frees its time', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const slot = await firstSlot(app, seed.apiKey, seed.eventType.id)
+    const headers = { ...auth(seed.apiKey), 'content-type': 'application/json' }
+
+    const created = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        eventTypeId: seed.eventType.id,
+        start: slot.start.epochMs,
+        guestName: 'Ada',
+        guestEmail: 'ada@example.com',
+      }),
+    })
+    const id = ((await created.json()) as { data: { id: string } }).data.id
+
+    const cancelled = await app.request(`/api/v1/bookings/${id}/cancel`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ reason: 'Something came up' }),
+    })
+    expect(cancelled.status).toBe(200)
+    expect(((await cancelled.json()) as { data: { status: string } }).data.status).toBe('cancelled')
+
+    // Cancelling releases the slot_locks rows in the same batch, so the time is
+    // immediately offered again.
+    const again = await firstSlot(app, seed.apiKey, seed.eventType.id)
+    expect(again.start.epochMs).toBe(slot.start.epochMs)
+
+    const twice = await app.request(`/api/v1/bookings/${id}/cancel`, { method: 'POST', headers, body: '{}' })
+    expect(twice.status).toBe(409)
+  })
+
+  it('rejects a malformed guestEmail', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const slot = await firstSlot(app, seed.apiKey, seed.eventType.id)
+
+    const res = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        eventTypeId: seed.eventType.id,
+        start: slot.start.iso,
+        guestName: 'Ada Lovelace',
+        guestEmail: 'not-an-email',
+      }),
+    })
+
+    expect(res.status).toBe(400)
+  })
+})
+
+/**
+ * Regression: `?status=cancelled`/`rescheduled` used to validate as an
+ * accepted value and then always return `{ data: [] }` — `listForHost`'s
+ * query is hardcoded to `status = 'confirmed'` (ADR-0003 keeps that port
+ * minimal), so the request-level filter ran against a list that could
+ * structurally never contain what was asked for. That's indistinguishable
+ * from "you truly have none in this range" from the caller's side. Rejecting
+ * the unsupported values is the honest response.
+ */
+describe('GET /bookings status filter', () => {
+  it('accepts status=confirmed', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const res = await app.request('/api/v1/bookings?status=confirmed', { headers: auth(seed.apiKey) })
+    expect(res.status).toBe(200)
+  })
+
+  it('rejects status=cancelled rather than silently returning an empty list', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const res = await app.request('/api/v1/bookings?status=cancelled', { headers: auth(seed.apiKey) })
+    expect(res.status).toBe(400)
+  })
+
+  it('rejects status=rescheduled rather than silently returning an empty list', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const res = await app.request('/api/v1/bookings?status=rescheduled', { headers: auth(seed.apiKey) })
+    expect(res.status).toBe(400)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------
+
+describe('webhooks', () => {
+  it('accepts a subscription to every event at once', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const events = ['booking.created', 'booking.rescheduled', 'booking.cancelled', 'booking.hosts_changed']
+    const res = await app.request('/api/v1/webhooks', {
+      method: 'POST',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'https://hooks.example.com/all', events }),
+    })
+    expect(res.status).toBe(201)
+    expect(((await res.json()) as { data: { events: string[] } }).data.events).toEqual(events)
+  })
+
+  it('accepts a subscription to booking.hosts_changed', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const res = await app.request('/api/v1/webhooks', {
+      method: 'POST',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'https://hooks.example.com/hosts', events: ['booking.hosts_changed'] }),
+    })
+    expect(res.status).toBe(201)
+    expect(((await res.json()) as { data: { events: string[] } }).data.events).toEqual(['booking.hosts_changed'])
+  })
+
+  it('returns the signing secret exactly once', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const headers = { ...auth(seed.apiKey), 'content-type': 'application/json' }
+
+    const created = await app.request('/api/v1/webhooks', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ url: 'https://hooks.example.com/cadence', events: ['booking.created'] }),
+    })
+    expect(created.status).toBe(201)
+    const body = (await created.json()) as { data: { id: string; secret?: string } }
+    expect(body.data.secret).toBeTruthy()
+
+    const listed = await app.request('/api/v1/webhooks', { headers: auth(seed.apiKey) })
+    const list = (await listed.json()) as { data: Array<{ id: string; secret?: string }> }
+    expect(list.data).toHaveLength(1)
+    expect(list.data[0]!.secret).toBeUndefined()
+  })
+
+  it('refuses a plain http endpoint', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const res = await app.request('/api/v1/webhooks', {
+      method: 'POST',
+      headers: { ...auth(seed.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'http://hooks.example.com/cadence', events: ['booking.created'] }),
+    })
+    expect(res.status).toBe(400)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// MCP
+// ---------------------------------------------------------------------------
+
+interface RpcResponse {
+  jsonrpc: string
+  id: number | string | null
+  result?: Record<string, unknown>
+  error?: { code: number; message: string }
+}
+
+async function rpc(
+  app: Hono,
+  key: string | null,
+  method: string,
+  params?: Record<string, unknown>,
+): Promise<{ status: number; body: RpcResponse }> {
+  const res = await app.request('/mcp', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      ...(key ? auth(key) : {}),
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, ...(params ? { params } : {}) }),
+  })
+  return { status: res.status, body: (await res.json()) as RpcResponse }
+}
+
+/**
+ * A reschedule moves the meeting with the people on it. A co-host added
+ * after booking (booking.hosts_changed) moves with it, one removed stays
+ * off — the dashboard already did this; the REST and MCP entry points
+ * re-resolved the event type's hosts and silently undid the change.
+ */
+describe('rescheduling keeps the booking\'s own hosts', () => {
+  it('through REST and through MCP', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const admin = await seedHost(ports)
+    const helper = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+    const team = await repos.teams.createWithFirstMember(
+      { id: 'team_api_resched', name: 'Resched Team', slug: 'resched-team', logoKey: null },
+      { userId: admin.user.id, role: 'admin', rrWeight: 1 },
+    )
+    await repos.teams.addMember({ teamId: team!.id, userId: helper.user.id, role: 'member', rrWeight: 1 })
+    await repos.eventTypes.create({
+      ...admin.eventType,
+      id: 'evt_resched_collective',
+      ownerUserId: null,
+      ownerTeamId: team!.id,
+      schedulingType: 'collective',
+      slug: 'resched',
+      scheduleId: null,
+    })
+    expect(
+      await repos.eventTypeHosts.replace('evt_resched_collective', [
+        { userId: admin.user.id, required: true, scheduleId: null, rrWeight: null },
+        { userId: helper.user.id, required: true, scheduleId: null, rrWeight: null },
+      ]),
+    ).toBe(true)
+
+    const { from, to } = nextWeek()
+    const slots = async () => {
+      const res = await app.request(`/api/v1/slots?eventTypeId=evt_resched_collective&from=${from}&to=${to}&tz=UTC`, { headers: auth(admin.apiKey) })
+      return ((await res.json()) as { data: Array<{ start: { iso: string; epochMs: number } }> }).data
+    }
+    const [first, second, third] = await slots()
+    const booked = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers: { ...auth(admin.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ eventTypeId: 'evt_resched_collective', start: first!.start.iso, guestName: 'Ada', guestEmail: 'ada@example.com', guestTimezone: 'UTC', additionalGuests: ['EXTRA@example.com', 'extra@example.com', 'ada@example.com'] }),
+    })
+    expect(booked.status).toBe(201)
+    const id = ((await booked.json()) as { data: { id: string } }).data.id
+    expect((await repos.bookings.byId(id))?.hostUserIds.sort()).toEqual([admin.user.id, helper.user.id].sort())
+
+    // The helper leaves this one meeting.
+    const changed = await changeBookingHosts(ports, admin.user, { bookingId: id, remove: [helper.user.id] }, repos)
+    expect(changed.ok).toBe(true)
+
+    // REST: the moved booking has the admin alone, as the original did.
+    const moved = await app.request(`/api/v1/bookings/${id}/reschedule`, {
+      method: 'POST',
+      headers: { ...auth(admin.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ start: second!.start.iso }),
+    })
+    expect(moved.status).toBe(201)
+    const movedId = ((await moved.json()) as { data: { id: string } }).data.id
+    expect((await repos.bookings.byId(movedId))?.hostUserIds).toEqual([admin.user.id])
+    expect((await repos.bookings.byId(movedId))?.additionalGuests).toEqual(['extra@example.com'])
+
+    // MCP: the same.
+    const viaMcp = await rpc(app, admin.apiKey, 'tools/call', {
+      name: 'reschedule_booking',
+      arguments: { bookingId: movedId, newStart: third!.start.iso },
+    })
+    expect(viaMcp.status).toBe(200)
+    const replacement = (await repos.bookings.byId(movedId))?.rescheduledTo
+    expect(replacement).toBeTruthy()
+    expect((await repos.bookings.byId(replacement!))?.hostUserIds).toEqual([admin.user.id])
+    expect((await repos.bookings.byId(replacement!))?.additionalGuests).toEqual(['extra@example.com'])
+  })
+
+  it('a round robin re-picks from the pool, unless a person handed the booking to a colleague', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const admin = await seedHost(ports)
+    const helper = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+    const team = await repos.teams.createWithFirstMember(
+      { id: 'team_api_rr_resched', name: 'RR Team', slug: 'rr-resched-team', logoKey: null },
+      { userId: admin.user.id, role: 'admin', rrWeight: 1 },
+    )
+    await repos.teams.addMember({ teamId: team!.id, userId: helper.user.id, role: 'member', rrWeight: 1 })
+    await repos.eventTypes.create({ ...admin.eventType, id: 'evt_rr_resched', ownerUserId: null, ownerTeamId: team!.id, schedulingType: 'round_robin', slug: 'rr-resched', scheduleId: null })
+    const { from, to } = nextWeek()
+    const res = await app.request(`/api/v1/slots?eventTypeId=evt_rr_resched&from=${from}&to=${to}&tz=UTC`, { headers: auth(admin.apiKey) })
+    const [first, second, third] = ((await res.json()) as { data: Array<{ start: { iso: string } }> }).data
+    const booked = await app.request('/api/v1/bookings', {
+      method: 'POST',
+      headers: { ...auth(admin.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ eventTypeId: 'evt_rr_resched', start: first!.start.iso, guestName: 'Ada', guestEmail: 'ada@example.com', guestTimezone: 'UTC' }),
+    })
+    expect(booked.status).toBe(201)
+    const id = ((await booked.json()) as { data: { id: string } }).data.id
+    const assigned = (await repos.bookings.byId(id))!.hostUserId
+    const actor = assigned === admin.user.id ? admin : helper
+
+    // Untouched: a move may land on either host — the pool is offered.
+    const moved = await app.request(`/api/v1/bookings/${id}/reschedule`, {
+      method: 'POST',
+      headers: { ...auth(actor.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ start: second!.start.iso }),
+    })
+    expect(moved.status).toBe(201)
+    const movedId = ((await moved.json()) as { data: { id: string } }).data.id
+    expect((await repos.bookings.byId(movedId))?.hostUserIds).toHaveLength(1)
+
+    // Handed to a colleague: the move keeps the colleague.
+    const owner = (await repos.bookings.byId(movedId))!.hostUserId
+    const actor2 = owner === admin.user.id ? admin : helper
+    const other = owner === admin.user.id ? helper.user : admin.user
+    expect((await changeBookingHosts(ports, actor2.user, { bookingId: movedId, add: [other.id], remove: [owner] }, repos)).ok).toBe(true)
+    const again = await app.request(`/api/v1/bookings/${movedId}/reschedule`, {
+      method: 'POST',
+      headers: { ...auth(other.id === admin.user.id ? admin.apiKey : helper.apiKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ start: third!.start.iso }),
+    })
+    expect(again.status).toBe(201)
+    const againId = ((await again.json()) as { data: { id: string } }).data.id
+    expect((await repos.bookings.byId(againId))?.hostUserIds).toEqual([other.id])
+  })
+})
+
+describe('JSON-RPC ids', () => {
+  it('answers a request whose id is null, and rejects an id that is an object', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const post = (body: unknown) =>
+      app.request('/mcp', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...auth(seed.apiKey) },
+        body: JSON.stringify(body),
+      })
+    const nullId = await post({ jsonrpc: '2.0', id: null, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } } })
+    expect(nullId.status).toBe(200)
+    const body = (await nullId.json()) as { id: unknown; result?: unknown }
+    expect(body.id).toBeNull()
+    expect(body.result).toBeDefined()
+
+    const objectId = await post({ jsonrpc: '2.0', id: { nested: true }, method: 'initialize' })
+    expect(objectId.status).toBe(400)
+
+    // Absent id: a notification, no body.
+    const notification = await post({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    expect(notification.status).toBe(202)
+  })
+})
+
+describe('MCP server', () => {
+  it('requires an API key, as a JSON-RPC error', async () => {
+    const app = buildApp(testPorts())
+    const { status, body } = await rpc(app, null, 'initialize', { protocolVersion: '2025-06-18' })
+    expect(status).toBe(401)
+    expect(body.error?.code).toBe(-32001)
+  })
+
+  it('negotiates the protocol version and advertises tools', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const init = await rpc(app, seed.apiKey, 'initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'test', version: '1' },
+    })
+    expect(init.status).toBe(200)
+    // The client asked for a version we speak, so it is echoed rather than
+    // silently upgraded.
+    expect(init.body.result?.['protocolVersion']).toBe('2025-06-18')
+    expect(init.body.result?.['serverInfo']).toMatchObject({ name: 'cadence' })
+
+    const list = await rpc(app, seed.apiKey, 'tools/list')
+    const tools = list.body.result?.['tools'] as Array<{ name: string; inputSchema: { required?: string[] } }>
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      'cancel_booking',
+      'create_booking',
+      'get_available_slots',
+      'list_event_types',
+      'reschedule_booking',
+    ])
+    expect(tools.find((t) => t.name === 'create_booking')!.inputSchema.required).toContain('start')
+  })
+
+  it('hides write tools from a read-only key', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports, ['read'])
+
+    const list = await rpc(app, seed.apiKey, 'tools/list')
+    const tools = list.body.result?.['tools'] as Array<{ name: string }>
+    expect(tools.map((t) => t.name).sort()).toEqual(['get_available_slots', 'list_event_types'])
+
+    const denied = await rpc(app, seed.apiKey, 'tools/call', {
+      name: 'cancel_booking',
+      arguments: { bookingId: 'anything' },
+    })
+    expect(denied.status).toBe(403)
+    expect(denied.body.error?.code).toBe(-32003)
+  })
+
+  it('list_event_types names the hosts of a team event type', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const other = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+    const team = await repos.teams.createWithFirstMember(
+      { id: 'team_mcp_hosts', name: 'MCP Hosts', slug: 'mcp-hosts', logoKey: null },
+      { userId: seed.user.id, role: 'admin', rrWeight: 1 },
+    )
+    await repos.teams.addMember({ teamId: team!.id, userId: other.user.id, role: 'member', rrWeight: 1 })
+    await repos.eventTypes.create({ ...seed.eventType, id: 'evt_mcp_hosts', ownerUserId: null, ownerTeamId: team!.id, schedulingType: 'collective', slug: 'crew', scheduleId: null })
+    await repos.eventTypeHosts.replace('evt_mcp_hosts', [
+      { userId: seed.user.id, required: true, scheduleId: null, rrWeight: null },
+      { userId: other.user.id, required: false, scheduleId: null, rrWeight: null },
+    ])
+
+    const res = await rpc(app, seed.apiKey, 'tools/call', { name: 'list_event_types', arguments: {} })
+    const content = JSON.parse((res.body.result as { content: Array<{ text: string }> }).content[0]!.text) as {
+      eventTypes: Array<{ id: string; hosts?: Array<{ name: string; required: boolean }> }>
+    }
+    const crew = content.eventTypes.find((et) => et.id === 'evt_mcp_hosts')!
+    expect(crew.hosts).toEqual([
+      { name: 'Test Host', required: true },
+      { name: 'Test Host', required: false },
+    ])
+    expect(content.eventTypes.find((et) => et.id === seed.eventType.id)!.hosts).toBeUndefined()
+  })
+
+  it('list_event_types includes team-owned event types, with the team slug in bookingUrl', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+    const repos = ports.repositories({ consistency: 'bookmark' })
+
+    // Same gap as the REST list endpoint: listForUser alone never returns a
+    // team-owned row, so an agent could get/reschedule/cancel a team event
+    // by id but never discover it exists.
+    const team = await repos.teams.createWithFirstMember(
+      { id: 'team_mcp_test', name: 'MCP Test Team', slug: 'mcp-test-team', logoKey: null },
+      { userId: seed.user.id, role: 'admin', rrWeight: 1 },
+    )
+    await repos.eventTypes.create({
+      id: 'evt_mcp_team_test',
+      ownerUserId: null,
+      ownerTeamId: team!.id,
+      schedulingType: 'round_robin',
+      slug: 'mcp-team-call',
+      title: 'MCP team call',
+      description: '',
+      durationMinutes: 30,
+      slotIntervalMinutes: null,
+      bufferBeforeMinutes: 0,
+      bufferAfterMinutes: 0,
+      minNoticeMinutes: 0,
+      maxHorizonDays: 60,
+      maxPerDay: null,
+      locationType: 'custom_link',
+      locationValue: null,
+      questions: [],
+      active: true,
+      scheduleId: null,
+    })
+
+    const call = await rpc(app, seed.apiKey, 'tools/call', {
+      name: 'list_event_types',
+      arguments: {},
+    })
+    const content = call.body.result?.['content'] as Array<{ type: string; text: string }>
+    const payload = JSON.parse(content[0]!.text) as {
+      eventTypes: Array<{ id: string; bookingUrl: string }>
+    }
+    expect(payload.eventTypes).toHaveLength(2)
+    const teamEvent = payload.eventTypes.find((et) => et.id === 'evt_mcp_team_test')
+    expect(teamEvent?.bookingUrl).toBe('https://cadence.test/mcp-test-team/mcp-team-call')
+  })
+
+  it('runs the slot and booking tools end to end', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const slots = await rpc(app, seed.apiKey, 'tools/call', {
+      name: 'get_available_slots',
+      arguments: { eventTypeId: seed.eventType.id, from: Date.now() + DAY_MS, limit: 5 },
+    })
+    const content = slots.body.result?.['content'] as Array<{ type: string; text: string }>
+    expect(content[0]!.type).toBe('text')
+    const payload = JSON.parse(content[0]!.text) as { slots: Array<{ start: string }> }
+    expect(payload.slots.length).toBeGreaterThan(0)
+
+    const booked = await rpc(app, seed.apiKey, 'tools/call', {
+      name: 'create_booking',
+      arguments: {
+        eventTypeId: seed.eventType.id,
+        start: payload.slots[0]!.start,
+        guestName: 'Agent Guest',
+        guestEmail: 'agent@example.com',
+      },
+    })
+    expect(booked.body.result?.['isError']).toBeUndefined()
+    const bookedText = JSON.parse((booked.body.result?.['content'] as Array<{ text: string }>)[0]!.text) as {
+      booked: boolean
+      bookingId: string
+    }
+    expect(bookedText.booked).toBe(true)
+
+    // The same slot again is a refusal the MODEL must handle, so it arrives as
+    // an isError result rather than a protocol error.
+    const clash = await rpc(app, seed.apiKey, 'tools/call', {
+      name: 'create_booking',
+      arguments: {
+        eventTypeId: seed.eventType.id,
+        start: payload.slots[0]!.start,
+        guestName: 'Second Guest',
+        guestEmail: 'second@example.com',
+      },
+    })
+    expect(clash.body.result?.['isError']).toBe(true)
+
+    const cancelled = await rpc(app, seed.apiKey, 'tools/call', {
+      name: 'cancel_booking',
+      arguments: { bookingId: bookedText.bookingId },
+    })
+    expect(cancelled.body.result?.['isError']).toBeUndefined()
+  })
+
+  it('reports protocol faults with JSON-RPC error codes', async () => {
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const unknown = await rpc(app, seed.apiKey, 'tools/call', { name: 'delete_everything', arguments: {} })
+    expect(unknown.body.error?.code).toBe(-32601)
+
+    const badArgs = await rpc(app, seed.apiKey, 'tools/call', {
+      name: 'get_available_slots',
+      arguments: { eventTypeId: seed.eventType.id, timezone: 'Mars/Olympus' },
+    })
+    expect(badArgs.body.error?.code).toBe(-32602)
+
+    const badMethod = await rpc(app, seed.apiKey, 'resources/list')
+    expect(badMethod.body.error?.code).toBe(-32601)
+
+    const notification = await app.request('/mcp', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...auth(seed.apiKey) },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
+    })
+    expect(notification.status).toBe(202)
+  })
+
+  it('rejects a malformed guestEmail on create_booking, same as REST', async () => {
+    // The MCP server's stated invariant is that an agent's authority equals
+    // its API key's — it can do exactly what a REST call with that key could
+    // do. REST validates guestEmail's format (see POST /bookings above); MCP
+    // must refuse the same input rather than accept it as a looser path.
+    const ports = testPorts()
+    const app = buildApp(ports)
+    const seed = await seedHost(ports)
+
+    const badEmail = await rpc(app, seed.apiKey, 'tools/call', {
+      name: 'create_booking',
+      arguments: {
+        eventTypeId: seed.eventType.id,
+        start: new Date(Date.now() + DAY_MS).toISOString(),
+        guestName: 'Agent Guest',
+        guestEmail: 'not-an-email',
+      },
+    })
+    expect(badEmail.body.error?.code).toBe(-32602)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Embed
+// ---------------------------------------------------------------------------
+
+describe('embed widget', () => {
+  it('serves a script under the 2 KB budget', async () => {
+    const app = buildApp(testPorts())
+    const res = await app.request('/embed.js')
+
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/javascript')
+    const body = await res.text()
+    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(2048)
+    expect(body).toContain('cadence.test')
+    expect(body).toContain('createElement')
+  })
+
+  it('embeds the configured origin rather than a relative URL', () => {
+    // A relative src would resolve against the CUSTOMER's origin, which is the
+    // one failure mode of this widget that looks fine in local development.
+    expect(embedScript('https://cadence.test/')).toContain('"https://cadence.test"')
+  })
+})
+
+describe('toInstant', () => {
+  it('accepts epoch milliseconds, as a number or a numeric string', () => {
+    expect(toInstant(1_800_000_000_000)).toBe(1_800_000_000_000)
+    expect(toInstant('1800000000000')).toBe(1_800_000_000_000)
+    expect(toInstant('-5000')).toBe(-5000)
+  })
+
+  it('accepts ISO-8601 with an explicit offset or Z', () => {
+    expect(toInstant('2026-11-03T09:00:00Z')).toBe(Date.parse('2026-11-03T09:00:00Z'))
+    expect(toInstant('2026-11-03T09:00:00+02:00')).toBe(Date.parse('2026-11-03T09:00:00+02:00'))
+    expect(toInstant('2026-11-03T09:00:00-0500')).toBe(Date.parse('2026-11-03T09:00:00-0500'))
+  })
+
+  // Every caller's error message promises "ISO-8601 with an offset, or epoch
+  // milliseconds" — `Date.parse` used to accept an offsetless string anyway,
+  // silently reading it as UTC and booking hours off from what a client that
+  // sent their own wall-clock time meant.
+  it('rejects ISO-8601 without an offset, rather than silently reading it as UTC', () => {
+    expect(toInstant('2026-11-03T09:00:00')).toBeNull()
+    expect(toInstant('2026-11-03')).toBeNull()
+  })
+
+  it('rejects garbage and empty input', () => {
+    expect(toInstant('')).toBeNull()
+    expect(toInstant('not a date')).toBeNull()
+  })
+})
+
+describe('placeholder BASE_URL', () => {
+  it('refuses to build ports rather than quietly generating dead links', () => {
+    // The template ships BASE_URL as a placeholder; a self-hoster who
+    // replaces only the resource ids and deploys must hit a clear error,
+    // not an instance whose every emailed link points at the placeholder.
+    expect(() =>
+      buildPorts({
+        ...env,
+        BASE_URL: 'https://cadence.YOUR-SUBDOMAIN.workers.dev',
+        ENCRYPTION_KEY_V1: keyMaterial(1),
+        SIGNING_KEY: keyMaterial(9),
+      } as Env),
+    ).toThrow(/BASE_URL/)
+  })
+})

@@ -1,0 +1,613 @@
+import { reminderOperation, type ActivityOperation, type ActivityRole } from '../core/domain/booking-activity.js'
+import { queueBookingMail, type ClaimedMailDelivery } from './booking-activity.js'
+/**
+ * Booking notifications.
+ *
+ * Lives beside the coordinator because the coordinator is the single path every
+ * booking takes (ADR-0002). The web booking flow previously enqueued only the
+ * calendar sync, so a guest who booked through the site received no
+ * confirmation at all — spec §4.1 requires both parties to get an email with an
+ * .ics attachment, and only the REST path did it.
+ *
+ * Everything here is best-effort and runs AFTER the commit. A mail provider
+ * having a bad minute must never cost a booking we already confirmed on screen.
+ */
+
+import { emailBranding } from '../core/domain/branding.js'
+import type { ReminderRule } from '../core/domain/reminders.js'
+import { bookingGuests } from '../core/domain/guests.js'
+import type { Booking, EventType, User, WebhookEvent } from '../core/domain/types.js'
+import type { EmailMessage, EnginePorts } from '../ports.js'
+import { calendarDescription, calendarTitle, participantsFor } from '../core/domain/calendar-text.js'
+import { hostSettings } from '../core/domain/hosts.js'
+import type { NotificationChannel } from '../core/domain/chat-notify.js'
+import {
+  bookingParticipantsChanged,
+  bookingCancelled,
+  bookingConfirmationForGuest,
+  bookingConfirmationForHost,
+  bookingRescheduled,
+  bookingReminder,
+} from '../core/email-templates.js'
+import {
+  ICS_CANCEL_CONTENT_TYPE,
+  buildIcs,
+  icsCancelSuppressed,
+  icsSequenceForBooking,
+  icsUidForBooking,
+} from '../core/ics.js'
+
+/** A booking known to have no predecessor gets an empty chain, not `undefined`. */
+const NO_CHAIN: ReadonlyMap<string, Booking> = new Map()
+
+export interface NotifyContext {
+  ports: EnginePorts
+  booking: Booking
+  eventType: EventType
+  /** The assigned host; for collective, the primary. */
+  host: User
+  hosts?: User[]
+  /** Raw manage token, so the emails can carry a working link. */
+  manageToken?: string
+}
+
+/**
+ * Confirmations for guest and host; synced hosts need no scheduling attachment.
+ *
+ * The attachment is METHOD:REQUEST so calendar clients offer to add it. The
+ * UID is stable across a reschedule chain and the SEQUENCE increases, which is
+ * what makes a client UPDATE the existing event rather than create a duplicate
+ * — the single most commonly botched part of .ics.
+ */
+export async function notifyBookingCreated(ctx: NotifyContext): Promise<void> {
+  ctx = { ...ctx, hosts: await notificationHosts(ctx) }
+  const { ports, booking, eventType, host } = ctx
+
+  // The replacement booking of a reschedule already gets a "Rescheduled" mail
+  // from the route that moved it. Sending "Confirmed" as well gives the guest
+  // two contradictory emails for one action.
+  if (booking.rescheduleOf) return
+  const manageUrl = ctx.manageToken
+    ? `${ports.config.baseUrl}/booking/${booking.id}?token=${encodeURIComponent(ctx.manageToken)}`
+    : undefined
+
+  let ics: string | undefined
+  try {
+    // `booking.rescheduleOf` is guaranteed null by the early return above, so
+    // this booking is always a root and an empty chain is the correct chain
+    // — not a shortcut, since `icsUidForBooking`/`icsSequenceForBooking`
+    // require one explicitly rather than defaulting it away.
+    ics = buildIcs({
+      uid: icsUidForBooking(booking, NO_CHAIN, ports.config.invitationUidDomain),
+      sequence: icsSequenceForBooking(booking, NO_CHAIN),
+      method: 'REQUEST',
+      booking,
+      eventType,
+      organizer: { email: host.email, name: host.name || host.slug },
+      attendees: [
+        ...bookingGuests(booking),
+        ...(ctx.hosts ?? [host]).map((h) => ({ email: h.email, name: h.name || h.slug })),
+      ],
+      ...(await invitationText(ports, booking, eventType, ctx.hosts ?? [host])),
+      // Calendar files are shared with all attendees; never embed the booker's manage token.
+    })
+  } catch (err) {
+    // A malformed invitation must not stop the confirmation itself: an email
+    // saying "you're booked" with no attachment still beats silence.
+    console.error('[cadence] ics generation failed', err)
+  }
+
+  // Cloudflare Queues caps a message at 128 KB. A host with many long custom
+  // questions can push the .ics past that, and a rejected batch would lose the
+  // confirmation ENTIRELY — so the attachment is dropped before the email is.
+  const encoded = ics ? base64(ics) : undefined
+  const attachments =
+    encoded && encoded.length <= 40_000
+      ? [{ filename: 'invite.ics', content: encoded, contentType: 'text/calendar; method=REQUEST' }]
+      : undefined
+  if (encoded && !attachments) {
+    console.warn('[cadence] .ics too large to attach; sending confirmation without it')
+  }
+
+  const shared = {
+    booking,
+    eventType,
+    host,
+    ...(ctx.hosts ? { hosts: ctx.hosts } : {}),
+    brandName: ports.config.brandName,
+    ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl),
+    supportEmail: ports.config.supportEmail,
+    ...(manageUrl ? { rescheduleUrl: manageUrl, cancelUrl: manageUrl } : {}),
+    hasAttachment: Boolean(attachments),
+  }
+
+  await Promise.all([
+    sendBookingEmails(ctx, 'confirmation', attachments,
+      (guestBooking, primary) => bookingConfirmationForGuest({ ...shared, booking: guestBooking,
+        ...(primary ? {} : { rescheduleUrl: undefined, cancelUrl: undefined }) }),
+      (recipient, hasAttachment) => bookingConfirmationForHost({ ...shared, host: recipient, hasAttachment })),
+    notifyWebhooks(ports, 'booking.created', booking, eventType),
+  ])
+}
+
+async function notificationHosts(ctx: Pick<NotifyContext, 'ports' | 'booking' | 'host' | 'hosts'>): Promise<User[]> {
+  const repos = ctx.ports.repositories({ consistency: 'unconstrained' })
+  const known = new Map([ctx.host, ...(ctx.hosts ?? [])].map((h) => [h.id, h]))
+  const hosts: User[] = []
+  for (const id of new Set(ctx.booking.hostUserIds.length ? ctx.booking.hostUserIds : [ctx.booking.hostUserId])) {
+    const user = known.get(id) ?? await repos.users.byId(id).catch((err) => {
+      console.error('[cadence] notification host lookup failed', err)
+      return null
+    })
+    if (user) hosts.push(user)
+  }
+  return hosts
+}
+
+/** Rebuild a delayed invitation for its current recipient, keeping verified booker links private. */
+export async function refreshInvitation(
+  ports: EnginePorts,
+  booking: Booking,
+  queued: EmailMessage,
+  role: ActivityRole,
+): Promise<EmailMessage | null> {
+  const repos = ports.repositories({ consistency: 'bookmark' })
+  const [eventType, host] = await Promise.all([
+    repos.eventTypes.byId(booking.eventTypeId),
+    repos.users.byId(booking.hostUserId),
+  ])
+  if (!eventType || !host) return null
+  const hosts = await notificationHosts({ ports, booking, host })
+  const email = queued.to.toLowerCase()
+  const recipientHost = hosts.find((h) => h.email.toLowerCase() === email)
+  const guest = bookingGuests(booking).find((g) => g.email.toLowerCase() === email)
+  const booker = email === booking.guestEmail.toLowerCase()
+  if (role === 'Host') {
+    if (!recipientHost || booker) return null
+  } else if (!guest || (role === 'Booker') !== booker || (!booker && recipientHost)) {
+    return null
+  }
+  const invite = await buildAttachment(ports, booking, eventType, host, hosts, 'REQUEST')
+  const attachments =
+    role === 'Host' && recipientHost
+      ? await attachmentsForHost(ports, booking, recipientHost, invite)
+      : invite
+  const shared = {
+    booking,
+    eventType,
+    hosts,
+    host,
+    ...(await emailBranding(repos.settings, ports.config.baseUrl)),
+    brandName: ports.config.brandName,
+    supportEmail: ports.config.supportEmail,
+    hasAttachment: Boolean(attachments),
+  }
+  if (role === 'Host' && recipientHost)
+    return {
+      to: recipientHost.email,
+      toName: recipientHost.name || recipientHost.slug,
+      attachments,
+      replyTo: booking.guestEmail,
+      ...bookingConfirmationForHost({ ...shared, host: recipientHost }),
+    }
+  if (!guest) return null
+  let manageUrl: string | undefined
+  if (booker) {
+    const prefix = ports.config.baseUrl + '/booking/' + booking.id + '?token='
+    for (const suffix of queued.text.split(prefix).slice(1)) {
+      const token = /^[A-Za-z0-9._~-]+/.exec(suffix)?.[0]
+      if (token && (await ports.crypto.hash(token)) === booking.manageTokenHash) {
+        manageUrl = prefix + token
+        break
+      }
+    }
+  }
+  return {
+    to: guest.email,
+    toName: guest.name,
+    attachments,
+    ...bookingConfirmationForGuest({
+      ...shared,
+      booking: { ...booking, guestEmail: guest.email, guestName: guest.name },
+      rescheduleUrl: manageUrl,
+      cancelUrl: manageUrl,
+    }),
+  }
+}
+
+/** Each recipient is independent, and only the original booker receives manage links. */
+async function sendBookingEmails(
+  ctx: Pick<NotifyContext, 'ports' | 'booking' | 'host' | 'hosts'>,
+  operation: ActivityOperation,
+  attachments: EmailMessage['attachments'],
+  guestContent: (booking: Booking, primary: boolean) => { subject: string; html: string; text: string },
+  hostContent: (host: User, hasAttachment: boolean) => { subject: string; html: string; text: string },
+  audience: ReminderRule['audience'] = 'both',
+  deliver?: ClaimedMailDelivery,
+  rule?: ReminderRule,
+): Promise<void> {
+  const { ports, booking } = ctx
+  const hosts = ctx.hosts ?? await notificationHosts(ctx)
+  const hostEmails = new Set(hosts.map((h) => h.email.toLowerCase()))
+  const sent = new Set<string>()
+  const send = async (message: EmailMessage, role: ActivityRole, detail = '') => {
+    const key = message.to.toLowerCase()
+    if (sent.has(key)) return
+    sent.add(key)
+    await queueBookingMail(ports,booking,operation,message,role,detail || (message.attachments ? 'Calendar invitation attached' : ''),deliver,rule)
+  }
+  const results = await Promise.allSettled([
+    ...(audience === 'hosts' ? [] : bookingGuests(booking)).filter((g, i) => audience === 'guests' || i === 0 || !hostEmails.has(g.email.toLowerCase())).map((guest, i) =>
+      send({ to: guest.email, toName: guest.name,
+        ...guestContent(i === 0 ? booking : { ...booking, guestName: guest.name, guestEmail: guest.email }, i === 0),
+        ...(attachments ? { attachments } : {}) }, i === 0 ? 'Booker' : 'Guest')),
+    ...(audience === 'guests' ? [] : hosts).map(async (host) => {
+      const hostAttachments = await attachmentsForHost(ports, booking, host, attachments)
+      await send({ to: host.email, toName: host.name || host.slug,
+        ...hostContent(host, Boolean(hostAttachments)), replyTo: booking.guestEmail,
+        ...(hostAttachments ? { attachments: hostAttachments } : {}) }, 'Host', attachments && !hostAttachments ? 'Calendar invitation omitted because this host has a synced event' : '')
+    }),
+  ])
+  for (const result of results) if (result.status === 'rejected') throw result.reason
+}
+
+/**
+ * Fan a booking event out to the host's registered webhooks.
+ *
+ * `deliverWebhook` in the queue consumer was fully implemented and
+ * `POST /api/v1/webhooks` handed back a signing secret, but nothing anywhere
+ * ever enqueued a `webhook` message — so a subscriber registered an endpoint,
+ * got a 201, and never received anything. The README advertises them.
+ */
+export async function notifyWebhooks(
+  ports: EnginePorts,
+  event: WebhookEvent,
+  booking: Booking,
+  eventType: EventType,
+  /** Event-specific fields merged into the payload — `hostsAdded` / `hostsRemoved` for a host change. */
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  const repos = ports.repositories({ consistency: 'unconstrained' })
+  // Every participating host's subscriptions, not just the primary's — a
+  // collective booking is equally an event for each of them.
+  const seen = new Set<string>()
+  for (const hostId of booking.hostUserIds.length > 0 ? booking.hostUserIds : [booking.hostUserId]) {
+    const hooks = await repos.webhooks.listForUser(hostId).catch(() => [])
+    for (const hook of hooks) {
+      if (seen.has(hook.id) || !hook.events.includes(event)) continue
+      seen.add(hook.id)
+      await ports.queue
+        .send({
+          kind: 'webhook',
+          webhookId: hook.id,
+          event,
+          payload: {
+            id: booking.id,
+            eventTypeId: eventType.id,
+            eventTypeSlug: eventType.slug,
+            title: eventType.title,
+            hostUserId: booking.hostUserId,
+            hostUserIds: booking.hostUserIds,
+            guestName: booking.guestName,
+            guestEmail: booking.guestEmail,
+            additionalGuests: booking.additionalGuests ?? [],
+            guestTimezone: booking.guestTimezone,
+            start: new Date(booking.startUtc).toISOString(),
+            end: new Date(booking.endUtc).toISOString(),
+            status: booking.status,
+            rescheduleOf: booking.rescheduleOf,
+            answers: booking.answers,
+            ...extra,
+          },
+          attempt: 0,
+        })
+        .catch((err) => console.error('[cadence] webhook failed to queue', err))
+    }
+  }
+
+  // Chat channels, the same way: each attending host's own, plus the
+  // owning team's. The message is built at delivery from the booking's
+  // state then, so a channel only needs to know which booking and why.
+  const channelIds = new Set<string>()
+  const owners: Array<['user' | 'team', string]> = (booking.hostUserIds.length > 0 ? booking.hostUserIds : [booking.hostUserId]).map((id) => ['user', id] as ['user', string])
+  if (eventType.ownerTeamId) owners.push(['team', eventType.ownerTeamId])
+  for (const [kind, id] of owners) {
+    // Through a resolved promise, so a repository set that predates
+    // channels (older fakes, a partial port) is a quiet empty list rather
+    // than a thrown TypeError that would take the webhooks down with it.
+    const channels = await Promise.resolve()
+      .then(() => repos.channels.listForOwner(kind, id))
+      .catch(() => [] as NotificationChannel[])
+    for (const ch of channels) {
+      if (channelIds.has(ch.id) || !ch.events.includes(event)) continue
+      channelIds.add(ch.id)
+      const hostsAdded = Array.isArray(extra['hostsAdded']) ? (extra['hostsAdded'] as string[]) : undefined
+      const hostsRemoved = Array.isArray(extra['hostsRemoved']) ? (extra['hostsRemoved'] as string[]) : undefined
+      await ports.queue
+        .send({ kind: 'chat', channelId: ch.id, event, bookingId: booking.id, ...(hostsAdded || hostsRemoved ? { extra: { ...(hostsAdded ? { hostsAdded } : {}), ...(hostsRemoved ? { hostsRemoved } : {}) } } : {}) })
+        .catch((err) => console.error('[cadence] chat notification failed to queue', err))
+    }
+  }
+}
+
+/**
+ * Walk back the reschedule chain so the UID stays anchored to its root.
+ *
+ * Without this a two-hop move (A→B→C) produces C's UID from B, and the guest's
+ * client creates a SECOND event instead of updating the first.
+ */
+async function loadChain(
+  ports: EnginePorts,
+  booking: Booking,
+): Promise<ReadonlyMap<string, Booking>> {
+  const chain = new Map<string, Booking>()
+  const repos = ports.repositories({ consistency: 'unconstrained' })
+  let cursor: string | null = booking.rescheduleOf
+  let guard = 0
+  while (cursor && guard++ < 20) {
+    const prev: Booking | null = await repos.bookings.byId(cursor)
+    if (!prev) break
+    chain.set(prev.id, prev)
+    cursor = prev.rescheduleOf
+  }
+  return chain
+}
+
+/**
+ * The invitation for an existing booking.
+ *
+ * Same UID as the original plus a higher SEQUENCE is what makes a calendar
+ * client UPDATE the event rather than add a duplicate — and without it the
+ * emails were telling the guest "the updated invite is attached" while
+ * attaching nothing, leaving the old time sitting in their calendar.
+ */
+async function buildAttachment(
+  ports: EnginePorts,
+  booking: Booking,
+  eventType: EventType,
+  host: User,
+  hosts: User[] | undefined,
+  method: 'REQUEST' | 'CANCEL',
+): Promise<Array<{ filename: string; content: string; contentType: string }> | undefined> {
+  // A booking that has itself been superseded by a later reschedule
+  // (`rescheduledTo` set) must never get a CANCEL .ics: its replacement's
+  // REQUEST shares the same UID, and a CANCEL computed from this booking's
+  // own chain depth has no way to see the replacement's SEQUENCE — the two
+  // can collide on the same number for the same UID, and a client that
+  // resolves the conflict by DTSTAMP can then drop the replacement, leaving
+  // the guest with nothing on their calendar instead of the moved meeting.
+  // No caller reaches this today with a superseded booking (every cancel
+  // entry point requires status 'confirmed', and a superseded booking is
+  // 'rescheduled'), but per `icsCancelSuppressed`'s docstring this must hold
+  // by construction, not by the accident of every call site remembering the
+  // status check.
+  if (method === 'CANCEL' && icsCancelSuppressed(booking)) return undefined
+  try {
+    const chain = await loadChain(ports, booking)
+    const ics = buildIcs({
+      uid: icsUidForBooking(booking, chain, ports.config.invitationUidDomain),
+      sequence: icsSequenceForBooking(booking, chain, method === 'CANCEL'),
+      method,
+      booking,
+      eventType,
+      organizer: { email: host.email, name: host.name || host.slug },
+      attendees: [
+        ...bookingGuests(booking),
+        ...(hosts ?? [host]).map((h) => ({ email: h.email, name: h.name || h.slug })),
+      ],
+      ...(await invitationText(ports, booking, eventType, hosts ?? [host])),
+    })
+    const encoded = base64(ics)
+    if (encoded.length > 40_000) return undefined
+    return [
+      {
+        filename: 'invite.ics',
+        content: encoded,
+        contentType: method === 'CANCEL' ? ICS_CANCEL_CONTENT_TYPE : 'text/calendar; method=REQUEST',
+      },
+    ]
+  } catch (err) {
+    // An email with no attachment still beats no email.
+    console.error('[cadence] ics generation failed', err)
+    return undefined
+  }
+}
+
+/**
+ * Base64 for the .ics body.
+ *
+ * Encodes UTF-8 bytes rather than code units: `btoa` throws on any character
+ * above U+00FF, and event titles routinely contain them.
+ */
+function base64(text: string): string {
+  const bytes = new TextEncoder().encode(text)
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
+async function attachmentsForHost(
+  ports: EnginePorts,
+  booking: Booking,
+  host: User,
+  attachments: EmailMessage['attachments'],
+): Promise<EmailMessage['attachments']> {
+  if (!attachments || Object.keys(booking.externalEventIds).length === 0) return attachments
+  try {
+    const connections = await ports.repositories({ consistency: 'unconstrained' }).connections.listForUser(host.id)
+    // A synced host already has the provider's event; the guest's UID would invite them to a separate event.
+    if (connections.some((connection) => booking.externalEventIds[connection.id])) return undefined
+  } catch (err) {
+    console.error('[cadence] host calendar attachment check failed', err)
+  }
+  return attachments
+}
+
+/**
+ * Cancellation, to BOTH parties.
+ *
+ * Lives here rather than in a route because both the REST path and the guest
+ * manage page cancel, and only one of them was notifying anyone — while the
+ * guest-facing page told the reader "the host is notified", which was simply
+ * untrue on that path.
+ */
+export async function notifyBookingCancelled(ctx: {
+  ports: EnginePorts
+  booking: Booking
+  eventType: EventType
+  host: User
+  hosts?: User[]
+  cancelledBy: 'host' | 'guest'
+  /**
+   * The host who actually cancelled, when one did. Without it the email
+   * credits every host of a team booking — "Alice and Bob cancelled" —
+   * when only Alice pressed the button and wrote the note.
+   */
+  actor?: User
+  /** A note to the guest, quoted in the email and attributed to whoever cancelled. */
+  reason?: string
+}): Promise<void> {
+  ctx = { ...ctx, hosts: await notificationHosts(ctx) }
+  const { ports, booking, eventType, host } = ctx
+  const shared = {
+    booking,
+    eventType,
+    host,
+    ...(ctx.hosts ? { hosts: ctx.hosts } : {}),
+    cancelledBy: ctx.cancelledBy,
+    ...(ctx.actor ? { cancelledByName: ctx.actor.name || ctx.actor.slug } : {}),
+    ...(ctx.reason ? { reason: ctx.reason } : {}),
+    brandName: ports.config.brandName,
+    ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl),
+    supportEmail: ports.config.supportEmail,
+  }
+
+  // METHOD:CANCEL with the chain's UID and a higher SEQUENCE — this is what
+  // actually removes the meeting from the guest's own calendar. The email copy
+  // already claims it has been removed.
+  const attachments = await buildAttachment(
+    ports, booking, eventType, host, ctx.hosts, 'CANCEL',
+  )
+  await Promise.all([
+    sendBookingEmails(ctx, 'cancellation', attachments,
+      (guestBooking) => bookingCancelled({ ...shared, booking: guestBooking, audience: 'guest', hasAttachment: Boolean(attachments) }),
+      (recipient, hasAttachment) => bookingCancelled({ ...shared, host: recipient, audience: 'host', hasAttachment })),
+    notifyWebhooks(ports, 'booking.cancelled', booking, eventType),
+  ])
+}
+
+/**
+ * A move, to BOTH parties.
+ *
+ * `notifyBookingCreated` deliberately skips a booking with `rescheduleOf` set,
+ * on the assumption that the route which moved it sends this instead. That was
+ * only true of the REST path — the guest manage page sent nothing at all, so a
+ * guest who moved their own meeting received no confirmation of the new time.
+ */
+export async function notifyBookingRescheduled(ctx: {
+  ports: EnginePorts
+  booking: Booking
+  previous: Booking
+  eventType: EventType
+  host: User
+  hosts?: User[]
+  manageToken?: string
+}): Promise<void> {
+  ctx = { ...ctx, hosts: await notificationHosts(ctx) }
+  const { ports, booking, eventType, host } = ctx
+  const manageUrl = ctx.manageToken
+    ? `${ports.config.baseUrl}/booking/${booking.id}?token=${encodeURIComponent(ctx.manageToken)}`
+    : undefined
+
+  // Computed before `shared`, not after: the copy claims an invite is
+  // attached, and that claim has to be true. A .ics that exceeded the size
+  // cap or failed to generate is dropped before the email is (buildAttachment
+  // itself), so the templates need to know which happened rather than assume.
+  //
+  // Same UID as the original, higher SEQUENCE: the client moves the existing
+  // event instead of leaving the old time and adding a second one.
+  const attachments = await buildAttachment(
+    ports, booking, eventType, host, ctx.hosts, 'REQUEST',
+  )
+
+  const shared = {
+    booking,
+    eventType,
+    host,
+    ...(ctx.hosts ? { hosts: ctx.hosts } : {}),
+    previous: { startUtc: ctx.previous.startUtc, endUtc: ctx.previous.endUtc },
+    brandName: ports.config.brandName,
+    ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl),
+    supportEmail: ports.config.supportEmail,
+    ...(manageUrl ? { rescheduleUrl: manageUrl, cancelUrl: manageUrl } : {}),
+    hasAttachment: Boolean(attachments),
+  }
+
+  await Promise.all([
+    sendBookingEmails(ctx, 'reschedule', attachments,
+      (guestBooking, primary) => bookingRescheduled({ ...shared, booking: guestBooking, audience: 'guest',
+        ...(primary ? {} : { rescheduleUrl: undefined, cancelUrl: undefined }) }),
+      (recipient, hasAttachment) => bookingRescheduled({ ...shared, host: recipient, audience: 'host', hasAttachment })),
+    notifyWebhooks(ports, 'booking.rescheduled', booking, eventType),
+  ])
+}
+
+/**
+ * The same title and description the calendar sync writes to Google and
+ * Microsoft (core/domain/calendar-text.ts), so the guest's .ics and the
+ * hosts' calendar events describe one meeting the same way.
+ */
+async function invitationText(
+  ports: EnginePorts,
+  booking: Booking,
+  eventType: EventType,
+  hosts: User[],
+): Promise<{ summary: string; description: string }> {
+  const settings = await hostSettings(ports.repositories({ consistency: 'unconstrained' }), eventType)
+  const participants = participantsFor(
+    eventType,
+    booking,
+    hosts.map((user) => ({ user, optional: settings.get(user.id)?.required === false })),
+  )
+  return { summary: calendarTitle(eventType, participants), description: calendarDescription(eventType, booking, participants) }
+}
+
+export async function notifyBookingReminder(ctx: NotifyContext, when: '24h' | '1h' | ReminderRule, deliver?: ClaimedMailDelivery): Promise<void> {
+  ctx = { ...ctx, hosts: await notificationHosts(ctx) }
+  const shared = { ...ctx, when, ...await emailBranding(ctx.ports.repositories({ consistency: 'unconstrained' }).settings, ctx.ports.config.baseUrl), brandName: ctx.ports.config.brandName, supportEmail: ctx.ports.config.supportEmail }
+  await sendBookingEmails(ctx, reminderOperation(typeof when === 'string' ? when : when.minutes), undefined,
+    (booking) => bookingReminder({ ...shared, booking, audience: 'guest' }),
+    (host) => bookingReminder({ ...shared, host, audience: 'host' }), typeof when === 'string' ? 'both' : when.audience, deliver, typeof when === 'string' ? {minutes: when === '24h' ? 1440 : 60,audience:'both'} : when)
+}
+
+export async function notifyBookingParticipantsChanged(ctx: NotifyContext & { previous: Booking }): Promise<void> {
+  const hosts = await notificationHosts(ctx)
+  const { ports, booking, previous, eventType, host } = ctx
+  const attachments = await buildAttachment(ports, booking, eventType, host, hosts, 'REQUEST')
+  const shared = { booking, eventType, host, hosts, brandName: ports.config.brandName,
+    supportEmail: ports.config.supportEmail, ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl),
+    bookingUrl: `${ports.config.baseUrl}/dashboard/bookings/${booking.id}` }
+  const previousEmails = new Set(bookingGuests(previous).map((g) => g.email.toLowerCase()))
+  const currentEmails = new Set(bookingGuests(booking).map((g) => g.email.toLowerCase()))
+  const manageUrl = ctx.manageToken
+    ? `${ports.config.baseUrl}/booking/${booking.id}?token=${encodeURIComponent(ctx.manageToken)}` : undefined
+  await sendBookingEmails({ ...ctx, hosts }, 'participants.updated', attachments,
+    (guestBooking, primary) => !previousEmails.has(guestBooking.guestEmail.toLowerCase()) || (primary && Boolean(manageUrl))
+      ? bookingConfirmationForGuest({ ...shared, booking: guestBooking, hasAttachment: Boolean(attachments),
+        ...(primary && manageUrl ? { rescheduleUrl: manageUrl, cancelUrl: manageUrl } : {}) })
+      : bookingParticipantsChanged({ ...shared, booking: guestBooking, audience: 'guest', hasAttachment: Boolean(attachments) }),
+    (recipient, hasAttachment) => bookingParticipantsChanged({ ...shared, host: recipient, audience: 'host', hasAttachment }))
+  const removed = bookingGuests(previous).filter((g) => !currentEmails.has(g.email.toLowerCase()))
+  // A removed guest's CANCEL must precede a later re-invitation, not consume its sequence.
+  const cancelBooking = { ...previous, revision: Math.max(0, (booking.revision ?? 1) - 1) }
+  const cancellation = await buildAttachment(ports, cancelBooking, eventType, host, hosts, 'CANCEL')
+  const hostEmails = new Set(hosts.map((h) => h.email.toLowerCase()))
+  for (const { email, name } of removed) {
+    if (hostEmails.has(email.toLowerCase())) continue
+    await queueBookingMail(ports,booking,'participant.removed',{
+      to: email,
+      ...bookingParticipantsChanged({ ...shared, booking: { ...cancelBooking, guestName: name, guestEmail: email }, audience: 'guest', removed: true, hasAttachment: Boolean(cancellation) }),
+      ...(cancellation ? { attachments: cancellation } : {}),
+    },'Former guest', cancellation ? 'Cancellation attached' : '')
+  }
+}

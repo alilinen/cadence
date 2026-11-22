@@ -1,0 +1,396 @@
+import { describe, expect, it } from 'vitest'
+import type { EventType, Slot, User } from '../../src/core/domain/types.js'
+import { CLASSIC } from '../../src/core/domain/appearance.js'
+import { bookingCalendar, eventHeader, hostsRow, joinNames, monthGrid, shellFoot, slotList, type BookingPageData } from '../../src/http/pages/booking.js'
+
+const host: User = {
+  id: 'u_host',
+  email: 'grace@example.com',
+  name: 'Grace Hopper',
+  tz: 'America/New_York',
+  slug: 'grace',
+  avatarKey: null,
+  company: null,
+  jobTitle: null,
+  companyUrl: null,
+  role: 'member',
+  createdAt: 0,
+}
+
+const eventType: EventType = {
+  id: 'et_1',
+  ownerUserId: 'u_host',
+  ownerTeamId: null,
+  schedulingType: 'personal',
+  slug: 'intro',
+  title: 'Intro call',
+  description: 'A short chat.',
+  durationMinutes: 30,
+  slotIntervalMinutes: null,
+  bufferBeforeMinutes: 0,
+  bufferAfterMinutes: 0,
+  minNoticeMinutes: 60,
+  maxHorizonDays: 60,
+  maxPerDay: null,
+  locationType: 'google_meet',
+  locationValue: null,
+  questions: [],
+  active: true,
+  createdAt: 0,
+  scheduleId: null,
+}
+
+function pageData(patch: Partial<BookingPageData> = {}): BookingPageData {
+  return {
+    host,
+    ownerSlug: 'grace',
+    eventType,
+    month: '2026-09',
+    daysWithSlots: new Map(),
+    guestTimezone: 'America/New_York',
+    baseUrl: 'https://example.test',
+    ...patch,
+  }
+}
+
+/** The text of one element inside the host identity block, tags stripped. */
+function hostBlockText(html: string, cls: 'pu-host-name' | 'pu-host-org'): string | null {
+  const match = new RegExp(`<p class="${cls}">([\\s\\S]*?)<\\/p>`).exec(html)
+  return match ? match[1]!.replace(/<[^>]+>/g, '').trim() : null
+}
+
+describe('eventHeader host identity', () => {
+  it('shows the host name, and no company line when none is set', () => {
+    const html = eventHeader(pageData())
+    expect(hostBlockText(html, 'pu-host-name')).toBe('Grace Hopper')
+    expect(hostBlockText(html, 'pu-host-org')).toBeNull()
+  })
+
+  it('shows the company as its own line under the name', () => {
+    const html = eventHeader(pageData({ host: { ...host, company: 'Acme Inc' } }))
+    expect(hostBlockText(html, 'pu-host-name')).toBe('Grace Hopper')
+    expect(hostBlockText(html, 'pu-host-org')).toBe('Acme Inc')
+  })
+
+  it('joins position and company on the identity line, either half optional', () => {
+    const both = eventHeader(pageData({ host: { ...host, jobTitle: 'CEO', company: 'Acme Inc' } }))
+    expect(hostBlockText(both, 'pu-host-org')).toBe('CEO, Acme Inc')
+    const titleOnly = eventHeader(pageData({ host: { ...host, jobTitle: 'CEO' } }))
+    expect(hostBlockText(titleOnly, 'pu-host-org')).toBe('CEO')
+  })
+
+  it('never shows a position on a team-owned event, same rule as company', () => {
+    const html = eventHeader(
+      pageData({
+        host: { ...host, jobTitle: 'CEO' },
+        eventType: { ...eventType, ownerUserId: null, ownerTeamId: 'team_1', schedulingType: 'round_robin' },
+      }),
+    )
+    expect(hostBlockText(html, 'pu-host-org')).toBeNull()
+  })
+
+  it('escapes an attacker-controlled company the same as the name', () => {
+    const html = eventHeader(pageData({ host: { ...host, company: '<script>alert(1)</script>' } }))
+    expect(html).not.toContain('<script>')
+    expect(html).toContain('&lt;script&gt;')
+  })
+
+  it('wraps the company in a link when a company URL is set — and only the company, not the title', () => {
+    const html = eventHeader(
+      pageData({ host: { ...host, jobTitle: 'CEO', company: 'Acme Inc', companyUrl: 'https://acme.example' } }),
+    )
+    expect(html).toContain(
+      '<a class="pu-host-link" href="https://acme.example" target="_blank" rel="noopener">Acme Inc</a>',
+    )
+    expect(hostBlockText(html, 'pu-host-org')).toBe('CEO, Acme Inc')
+  })
+
+  it('a company URL without a company name links nothing', () => {
+    const html = eventHeader(pageData({ host: { ...host, companyUrl: 'https://acme.example' } }))
+    expect(html).not.toContain('pu-host-link')
+  })
+
+  it('escapes a hostile stored company URL rather than letting it break out of the href', () => {
+    // Save-time validation (isHttpUrl) is the real gate; this proves the
+    // renderer alone still cannot be broken out of by a stored value.
+    const html = eventHeader(
+      pageData({ host: { ...host, company: 'Acme', companyUrl: 'https://a.example/"><script>x</script>' } }),
+    )
+    expect(html).not.toContain('<script>')
+  })
+
+  it('never shows a company on a team-owned event — "host" there is one representative member, not the team', () => {
+    const html = eventHeader(
+      pageData({
+        host: { ...host, company: 'Acme Inc' },
+        eventType: { ...eventType, ownerUserId: null, ownerTeamId: 'team_1', schedulingType: 'round_robin' },
+      }),
+    )
+    expect(hostBlockText(html, 'pu-host-name')).toBe('Grace Hopper')
+    expect(html).not.toContain('Acme Inc')
+  })
+
+  it('a team page is headed by the company logo — the brand beside a round one, nothing beside a wordmark, no row without one', () => {
+    const team = { id: 'team_1', name: 'Support Crew', slug: 'support', logoKey: null, createdAt: 0 }
+    const teamEvent = { ...eventType, ownerUserId: null, ownerTeamId: 'team_1', schedulingType: 'round_robin' as const }
+    const key = `${'ab'.repeat(32)}-thumb.webp`
+    const round = eventHeader(pageData({ eventType: teamEvent, team, companyLogo: { key, shape: 'circle' }, brandName: 'Acme' }))
+    expect(round).toContain(`/avatars/${key}`)
+    expect(hostBlockText(round, 'pu-host-name')).toBe('Acme')
+    expect(round).not.toContain('Support Crew')
+    const wordmark = eventHeader(pageData({ eventType: teamEvent, team, companyLogo: { key, shape: 'natural' }, brandName: 'Acme' }))
+    expect(wordmark).toContain(`/avatars/${'ab'.repeat(32)}-fit.webp`)
+    expect(wordmark).not.toContain('pu-host-name')
+    const bare = eventHeader(pageData({ eventType: teamEvent, team, companyLogo: null, brandName: 'Acme' }))
+    expect(bare).not.toContain('class="pu-host"')
+    expect(bare).toContain('<h1>Intro call</h1>')
+    // The event type's own logo wins over the company's.
+    const own = eventHeader(pageData({ eventType: { ...teamEvent, logoKey: `${'cd'.repeat(32)}-thumb.webp` }, team, companyLogo: { key, shape: 'circle' }, brandName: 'Acme' }))
+    expect(own).toContain(`/avatars/${'cd'.repeat(32)}-thumb.webp`)
+    expect(own).not.toContain(`/avatars/${key}`)
+  })
+})
+
+describe('Cadence-owned booking footer', () => {
+  it('links to the installation’s own privacy and terms pages', () => {
+    const html = shellFoot(true, false, 'Cadence')
+    expect(html).toContain('Booking footer')
+    expect(html).toContain('/privacy')
+    expect(html).toContain('href="/terms"')
+    expect(html).not.toContain('scheduling by')
+  })
+  it('never reflects an attacker-controlled operator string', () => {
+    expect(shellFoot(true, false, '<img onerror=x>')).not.toContain('onerror')
+  })
+  it('retains the embedding resize handshake', () => {
+    expect(shellFoot(true, true)).toContain('postMessage')
+  })
+})
+
+/**
+ * Regression: the timezone picker form used to always post back to the
+ * month/day view, which silently dropped whatever page-specific state
+ * (selected day, chosen slot) the guest had already committed to.
+ */
+describe('eventHeader timezone picker', () => {
+  it('preserves the selected day when switching zones on the day view', () => {
+    const html = eventHeader(pageData({ selectedDate: '2026-09-10' }))
+    expect(html).toContain('action="/grace/intro"')
+    expect(html).toContain('name="date" value="2026-09-10"')
+  })
+
+  it('posts to /confirm with the chosen slot on the confirm page', () => {
+    const html = eventHeader(pageData({ confirmStart: 1789000000000 }))
+    expect(html).toContain('action="/grace/intro/confirm"')
+    expect(html).toContain('name="start" value="1789000000000"')
+    // The confirm context has no date/month to preserve — carrying them
+    // over would just be dead query params on a route that ignores them.
+    expect(html).not.toContain('name="date"')
+    expect(html).not.toContain('name="month"')
+  })
+
+  it('offers UTC even when the guest is not already on it', () => {
+    const html = eventHeader(pageData({ guestTimezone: 'America/New_York' }))
+    expect(html).toContain('<option value="UTC"')
+  })
+
+  /**
+   * Regression: the option list is built once per isolate and patched per
+   * request (see TIMEZONE_OPTIONS_BASE) rather than re-escaped every time —
+   * a real request-rate CI failure traced back to the unoptimized version
+   * being slow enough to let the rate limiter's token bucket refill mid-test.
+   * The patching must still mark exactly one option `selected`, and must not
+   * corrupt a look-alike zone name in the process.
+   */
+  it('marks exactly one option selected, and it is the guest zone', () => {
+    const html = eventHeader(pageData({ guestTimezone: 'America/New_York' }))
+    const selectedCount = (html.match(/ selected>/g) ?? []).length
+    expect(selectedCount).toBe(1)
+    expect(html).toContain('value="America/New_York" selected>')
+  })
+
+  it('prepends an unrecognized guest zone rather than dropping it', () => {
+    // A real zone, but a legacy alias `supportedValuesOf('timeZone')` omits
+    // from its canonical list — still valid input to Intl itself, so this
+    // exercises the "not in TIMEZONES" branch without an invalid-timezone
+    // exception from the unrelated offset-label formatting.
+    const html = eventHeader(pageData({ guestTimezone: 'US/Eastern' }))
+    expect(html).toContain('value="US/Eastern" selected>')
+  })
+})
+
+/**
+ * Regression: the calendar never marked the chosen day — the only highlight
+ * was the aria-current="date" ring on *today*, so switching days changed the
+ * slot list while the calendar's apparent selection stayed put.
+ */
+describe('monthGrid selected day', () => {
+  const withSlots = new Map([
+    ['2026-09-10', true],
+    ['2026-09-11', true],
+  ])
+
+  it('marks exactly the selected day, and announces it in the label', () => {
+    const html = monthGrid(pageData({ daysWithSlots: withSlots, selectedDate: '2026-09-10' }))
+    const marked = (html.match(/aria-selected="true"/g) ?? []).length
+    expect(marked).toBe(1)
+    expect(html).toMatch(/<a class="pu-day"[^>]*aria-selected="true"[^>]*aria-label="[^"]*, selected">10<\/a>/)
+  })
+
+  it('marks nothing when no day is selected', () => {
+    const html = monthGrid(pageData({ daysWithSlots: withSlots }))
+    expect(html).not.toContain('aria-selected')
+  })
+
+  it('marks nothing when the selected day is in another month than the one displayed', () => {
+    const html = monthGrid(pageData({ daysWithSlots: withSlots, selectedDate: '2026-10-10' }))
+    expect(html).not.toContain('aria-selected')
+  })
+
+  it('still marks a selected day that has no slots — the slot list says "no times" for that same day', () => {
+    const html = monthGrid(pageData({ daysWithSlots: withSlots, selectedDate: '2026-09-12' }))
+    expect(html).toContain('<span class="pu-day" aria-disabled="true" aria-selected="true">12</span>')
+  })
+})
+
+/**
+ * The slot picker must go through the shared slot-state → class
+ * mapping (src/core/slot-state.ts), not a hardcoded "pu-slot" literal — this
+ * is the one place the semantic token layer's slot states are actually
+ * proven live, since the query engine (src/core/slots/engine.ts) only ever
+ * hands this page 'available' slots.
+ */
+describe('slotList slot-state wiring', () => {
+  const slots: Slot[] = [{ start: 1_789_000_000_000, end: 1_789_001_800_000, eligibleHostIds: ['u_host'] }]
+
+  it('renders each slot with the shared available slot-state class, not a bare "pu-slot"', () => {
+    const html = slotList(pageData({ selectedDate: '2026-09-10', slots }))
+    expect(html).toContain('class="pu-slot pu-slot-available"')
+    expect(html).not.toContain('class="pu-slot"')
+  })
+
+  it('still renders as a real, focusable link — available slots stay interactive', () => {
+    const html = slotList(pageData({ selectedDate: '2026-09-10', slots }))
+    expect(html).toMatch(/<a class="pu-slot pu-slot-available" href="[^"]+" rel="nofollow">/)
+  })
+})
+
+
+// ===========================================================================
+// Team pages: the team heads the page; the hosts row says who the guest meets
+// ===========================================================================
+
+describe('team-owned page header and hosts row', () => {
+  const team = { id: 't_1', name: 'Support Crew', slug: 'support-crew', logoKey: null, createdAt: 0 }
+  const teamEvent: EventType = { ...eventType, ownerUserId: null, ownerTeamId: 't_1', schedulingType: 'collective' }
+  const person = (id: string, name: string, required = true) => ({
+    user: { ...host, id, name, slug: id } as User,
+    required,
+    scheduleId: null,
+    rrWeight: 1,
+  })
+
+  it('never heads a team page with the representative member — nor with the team, which is a suffix after the hosts', () => {
+    const html = eventHeader(pageData({ team, eventType: teamEvent }))
+    expect(html).not.toContain('Grace Hopper')
+    expect(html).not.toContain('Support Crew')
+    expect(html).not.toContain('class="pu-host"')
+  })
+
+  it('keeps the team avatars with event details, between the description and meeting metadata', () => {
+    const html = eventHeader(pageData({ team, eventType: teamEvent, hosts: [person('alice', 'Alice')] }))
+    const description = html.indexOf(teamEvent.description)
+    const hosts = html.indexOf('class="pu-hosts"')
+    const metadata = html.indexOf('class="pu-meta"')
+    expect(description).toBeLessThan(hosts)
+    expect(hosts).toBeLessThan(metadata)
+    expect(html.slice(hosts, metadata)).toContain("You'll meet <strong>Alice</strong>")
+    expect((html.match(/class="pu-hosts"/g) ?? []).length).toBe(1)
+  })
+
+  it('collective: "You\'ll meet" the required hosts; optional ones "join when free"; round robin: "With one of"', () => {
+    const hosts = [person('a', 'Alice'), person('b', 'Bob'), person('c', 'Carol')]
+    const collective = hostsRow({ eventType: teamEvent, hosts })
+    expect(collective).toContain("You'll meet <strong>Alice, Bob and Carol</strong>")
+    expect(collective).not.toContain('when free')
+
+    const mixed = hostsRow({ eventType: teamEvent, hosts: [person('a', 'Alice'), person('b', 'Bob', false), person('c', 'Carol', false)] })
+    expect(mixed).toContain("You'll meet <strong>Alice</strong>. <strong>Bob and Carol</strong> join when free")
+    const one = hostsRow({ eventType: teamEvent, hosts: [person('a', 'Alice'), person('b', 'Bob', false)] })
+    expect(one).toContain('<strong>Bob</strong> joins when free')
+
+    // Round robin: attendance flags do not apply; the whole pool is named.
+    const rr = hostsRow({ eventType: { ...teamEvent, schedulingType: 'round_robin' }, hosts: [person('a', 'Alice'), person('b', 'Bob', false)] })
+    expect(rr).toContain('With one of <strong>Alice or Bob</strong>')
+    expect(rr).not.toContain('when free')
+  })
+
+  it('names the team modestly after the people — and not at all when the team hides its name', () => {
+    const team = { id: 'team_1', name: 'Support Crew', slug: 'support', logoKey: null, createdAt: 0 }
+    const hosts = [person('a', 'Alice'), person('b', 'Bob', false)]
+    const shown = hostsRow({ eventType: teamEvent, hosts, team })
+    expect(shown).toContain("You'll meet <strong>Alice</strong> <span class=\"pu-hosts-team\">(Support Crew)</span>. <strong>Bob</strong> joins when free")
+    const hidden = hostsRow({ eventType: teamEvent, hosts, team: { ...team, showName: false } })
+    expect(hidden).not.toContain('Support Crew')
+    // Only optional hosts: the suffix still lands, at the end.
+    const optionalOnly = hostsRow({ eventType: teamEvent, hosts: [person('b', 'Bob', false)], team })
+    expect(optionalOnly).toContain('joins when free <span class="pu-hosts-team">(Support Crew)</span>')
+    expect(hostsRow({ eventType: teamEvent, hosts, team: { ...team, name: '<b>' } })).toContain('(&lt;b&gt;)')
+  })
+
+  it('more than four hosts collapse to three plus a CSS-only "and N more"', () => {
+    const hosts = ['Alice', 'Bob', 'Carol', 'Dan', 'Eve'].map((n) => person(n.toLowerCase(), n))
+    const html = hostsRow({ eventType: teamEvent, hosts })
+    expect(html).toContain('<strong>Alice, Bob, Carol</strong>')
+    expect(html).toContain('<summary>and 2 more</summary><span>Dan and Eve</span>')
+    expect(html).toContain('<span class="pu-hosts-count" aria-hidden="true">+2</span>')
+    expect(html).not.toContain('<script')
+  })
+
+  it('renders nothing for a personal page, and escapes names', () => {
+    expect(hostsRow({ eventType, hosts: [person('u_host', 'Grace')] })).toBe('')
+    const html = hostsRow({ eventType: teamEvent, hosts: [person('x', '<b>X</b>')] })
+    expect(html).not.toContain('<b>X</b>')
+    expect(html).toContain('&lt;b&gt;X&lt;/b&gt;')
+  })
+
+  it('joinNames', () => {
+    expect(joinNames([])).toBe('')
+    expect(joinNames(['A'])).toBe('A')
+    expect(joinNames(['A', 'B'])).toBe('A and B')
+    expect(joinNames(['A', 'B', 'C'], 'or')).toBe('A, B or C')
+  })
+})
+
+describe('public booking layouts', () => {
+  const slots = Array.from({ length: 8 }, (_, index) => {
+    const start = Date.parse('2026-10-30T15:00:00Z') + index * 86_400_000
+    return { start, end: start + 1_800_000, eligibleHostIds: [host.id] }
+  })
+  const data = (layout: 'week' | 'agenda', date: string) => pageData({
+    host: { ...host, appearance: { ...CLASSIC, layout } },
+    selectedDate: date, month: date.slice(0, 7), embed: true,
+  })
+
+  it('keeps individual confirm links, guest timezone and embed across the month and DST boundary', () => {
+    const html = bookingCalendar(data('week', '2026-11-01'), slots, '2026-10-29')
+    expect(html.match(/class="pu-pick-day"/g)).toHaveLength(7)
+    for (const slot of slots.slice(0, 3)) {
+      expect(html).toContain('/grace/intro/confirm?start=' + slot.start + '&amp;tz=America%2FNew_York&amp;embed=1')
+    }
+    expect(html).not.toContain('/confirm?start=' + slots[3]!.start)
+    expect(html).toContain('?date=2026-11-02&amp;tz=America%2FNew_York&amp;embed=1')
+  })
+
+  it('pages through ordered available dates and keeps the first date open', () => {
+    const first = bookingCalendar(data('agenda', '2026-11-01'), slots, '2026-10-29')
+    expect(first.match(/class="pu-agenda-day"/g)).toHaveLength(5)
+    expect(first.match(/class="pu-agenda-day" open/g)).toHaveLength(1)
+    expect(first).toContain('?date=2026-11-06&amp;tz=America%2FNew_York&amp;embed=1')
+    const last = bookingCalendar(data('agenda', '2026-11-06'), slots, '2026-10-29')
+    expect(last.match(/class="pu-agenda-day"/g)).toHaveLength(1)
+    expect(last).toContain('Earlier dates')
+    expect(last).toContain('/confirm?start=' + slots[7]!.start)
+    expect(last).not.toContain('More dates')
+  })
+})

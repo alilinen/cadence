@@ -1,0 +1,394 @@
+import type { BookingAppearance } from './appearance.js'
+import type { ReminderRule } from './reminders.js'
+import type { LogoShape } from './media.js'
+export type { CompanyLogo, LogoShape } from './media.js'
+
+/**
+ * Domain types. Pure data — no I/O, no Cloudflare imports (ADR-0003 §5).
+ *
+ * Time is UTC epoch milliseconds everywhere. Wall-clock time exists only at
+ * two edges: interpreting a host's availability schedule, and rendering slots
+ * to a guest. Everything between is instants (ADR-0004 §1).
+ */
+
+/** Half-open `[start, end)`. Without exception — it is what makes 09:00–09:30 and 09:30–10:00 non-overlapping. */
+export interface Interval {
+  start: number
+  end: number
+}
+
+// ---------------------------------------------------------------------------
+// Users, teams
+// ---------------------------------------------------------------------------
+
+export interface User {
+  appearance?: BookingAppearance | null
+  id: string
+  email: string
+  name: string
+  /** IANA zone. The schedule below is interpreted in it. */
+  tz: string
+  slug: string
+  /**
+   * Content-addressed R2 key of the resized avatar thumbnail, or
+   * null when nothing has been uploaded — every renderer falls back to an
+   * initials badge in that case. Points at the DERIVED thumbnail, not the
+   * original: the original lives in R2 under a related key (see
+   * `thumbKeyFor` in `core/domain/media.ts`) but nothing on this row needs to
+   * address it directly, because nothing serves it in this pass.
+   */
+  avatarKey: string | null
+  /** Free-text company/organisation, shown next to the name on the booking page and in confirmation emails. Null until set — never required. */
+  company: string | null
+  /** Free-text job title/position, shown with the company ("CEO, Acme Inc"). Null until set — never required. */
+  jobTitle: string | null
+  /** Optional https URL wrapped around the company name on the booking page. Null until set. */
+  companyUrl: string | null
+  /**
+   * Instance role. The FIRST user of a fresh instance bootstraps as 'admin'
+   * (consumeMagicLink's create branch); admins manage users and instance
+   * settings from the dashboard and can promote/demote others — but never
+   * demote the last admin, or the instance locks itself out.
+   */
+  role: 'admin' | 'member'
+  /** Local hour (0–23) the morning digest goes out at; null or absent = off (core/domain/digest.ts). */
+  digestHour?: number | null
+  /** Host-local date (YYYY-MM-DD) the digest last went out on. */
+  digestSentOn?: string | null
+  createdAt: number
+}
+
+export interface Team {
+  appearance?: BookingAppearance | null
+  id: string
+  name: string
+  slug: string
+  /**
+   * No longer shown anywhere: a team is not a brand, so the company logo
+   * (an instance setting) heads team pages instead. The column is kept
+   * so a downgrade loses nothing; nothing reads it.
+   */
+  logoKey: string | null
+  /**
+   * Whether guests see the team's name — as a modest suffix after the
+   * hosts' names and in the page title. Optional for older fixtures; the
+   * repository always fills it, and absent means shown.
+   */
+  showName?: boolean
+  createdAt: number
+}
+
+export type TeamRole = 'owner' | 'admin' | 'member'
+
+export interface TeamMember {
+  teamId: string
+  userId: string
+  role: TeamRole
+  /** Round-robin weight; higher gets proportionally more bookings. */
+  rrWeight: number
+}
+
+// ---------------------------------------------------------------------------
+// Event types
+// ---------------------------------------------------------------------------
+
+export type LocationType = 'google_meet' | 'custom_link' | 'phone' | 'in_person'
+export type SchedulingType = 'personal' | 'round_robin' | 'collective'
+
+export interface EventTypeQuestion {
+  id: string
+  label: string
+  type: 'text' | 'textarea' | 'select'
+  required: boolean
+  options?: string[]
+}
+
+/**
+ * One host of a team-owned event type, when the event type names its hosts
+ * explicitly. No rows for an event type = every current member of the team,
+ * all required, on their default schedules — the behaviour from before this
+ * table existed, so nothing needs backfilling.
+ */
+export interface EventTypeHost {
+  eventTypeId: string
+  userId: string
+  /**
+   * Collective: a required host must be free for a slot to exist at all; an
+   * optional one joins the booking when free and is left out otherwise.
+   * Round-robin: every host in the set is a candidate, this flag is unused.
+   */
+  required: boolean
+  /** Which of this host's schedules the event type draws from; null = their default. */
+  scheduleId: string | null
+  /** Round-robin weight for this event type; null = the host's team weight. */
+  rrWeight: number | null
+  /** Display and tie-break order, from the admin's list. */
+  position: number
+}
+
+export interface EventType {
+  reminderRules?: ReminderRule[]
+  publicAgenda?: string | null
+  /** Private meeting definition; never offered on public booking pages. */
+  oneOff?: boolean
+  id: string
+  ownerUserId: string | null
+  ownerTeamId: string | null
+  schedulingType: SchedulingType
+  slug: string
+  title: string
+  description: string
+  /** Minutes. Must be a multiple of 5 — the bucket grid (ADR-0002 §1). */
+  durationMinutes: number
+  /** Slot grid step. Defaults to duration when null (ADR-0004 §3.4). */
+  slotIntervalMinutes: number | null
+  bufferBeforeMinutes: number
+  bufferAfterMinutes: number
+  minNoticeMinutes: number
+  maxHorizonDays: number
+  /** Per host-local calendar date; null means unlimited. */
+  maxPerDay: number | null
+  locationType: LocationType
+  locationValue: string | null
+  questions: EventTypeQuestion[]
+  /**
+   * The event type's own logo (a thumbnail blob key, same convention as
+   * `User.avatarKey`). When set it heads the booking page and the social
+   * card instead of the host's photo or the team's logo. Optional in the
+   * type so the many fixtures that predate it stay valid; the repository
+   * always fills it.
+   */
+  logoKey?: string | null
+  /** How the logo is shown; see `LogoShape`. Optional for older fixtures; the repository always fills it. */
+  logoShape?: LogoShape
+  active: boolean
+  createdAt: number
+  /**
+   * Which of the owner's schedules this event type draws hours from. Null
+   * means "the owner's default schedule" — today's exact behavior, so every
+   * pre-existing row reads correctly with no backfill needed. Only
+   * meaningful for a personal event type (single `ownerUserId`); a team
+   * event type (`round_robin`/`collective`) has multiple hosts and no
+   * single schedule fits all of them, so this is ignored there and each
+   * host keeps using their own default (see `engine.ts`'s `forEventType`).
+   */
+  scheduleId: string | null
+}
+
+// ---------------------------------------------------------------------------
+// Availability
+// ---------------------------------------------------------------------------
+
+/** Minutes from local midnight. 540 = 09:00. Half-open, like every interval. */
+export interface DayWindow {
+  startMinute: number
+  endMinute: number
+}
+
+/** Index 0 = Sunday, matching `Date.getUTCDay()`. */
+export type WeeklySchedule = [
+  DayWindow[], DayWindow[], DayWindow[], DayWindow[], DayWindow[], DayWindow[], DayWindow[],
+]
+
+/** Replaces the whole day's windows, including with none (a day off). */
+export interface DateOverride {
+  /** `YYYY-MM-DD` in the host's timezone. */
+  date: string
+  windows: DayWindow[]
+}
+
+export interface Availability {
+  userId: string
+  timezone: string
+  weekly: WeeklySchedule
+  overrides: DateOverride[]
+}
+
+/**
+ * A named, storable schedule — what `Availability` becomes once a host can
+ * have more than one. Extends rather than replaces `Availability`
+ * on purpose: the slot engine's `HostAvailabilityInput.availability:
+ * Availability` (core/slots/engine.ts) keeps typechecking unchanged when
+ * handed a `Schedule`, so the best-tested code in the repo is untouched by
+ * this feature.
+ */
+export interface Schedule extends Availability {
+  id: string
+  name: string
+  /** At most one per user — enforced by a partial unique index in D1. */
+  isDefault: boolean
+  /**
+   * Who created the row: the owner themselves, or a team admin setting up
+   * availability on their behalf (core/domain/teams.ts). Null on rows that
+   * predate the column. The schedules page shows "set up by …" when this is
+   * someone other than the owner, because a host finding hours on their
+   * calendar they never typed deserves to know where they came from.
+   */
+  createdBy?: string | null
+}
+
+// ---------------------------------------------------------------------------
+// Bookings
+// ---------------------------------------------------------------------------
+
+export type BookingStatus = 'confirmed' | 'cancelled' | 'rescheduled'
+
+export interface Booking {
+  id: string
+  eventTypeId: string
+  /** The assigned host. For collective, the first of `hostUserIds`. */
+  hostUserId: string
+  /** Every participating host. One entry unless collective. */
+  hostUserIds: string[]
+  guestName: string
+  guestEmail: string
+  additionalGuests?: string[]
+  /** In-place edits; also contribute to the stable calendar invitation sequence. */
+  revision?: number
+  calendarSyncRevision?: number
+  calendarCheckedAt?: number
+  calendarSyncError?: string | null
+  guestTimezone: string
+  startUtc: number
+  endUtc: number
+  /**
+   * Host-local calendar date of the start, `YYYY-MM-DD`, stamped at creation.
+   * The per-day cap is defined on host-local dates (ADR-0004 §3.7), and SQLite
+   * has no timezone data to derive it, so it is stored rather than computed.
+   */
+  localDate: string
+  status: BookingStatus
+  answers: Record<string, string>
+  /** Provider event ids, keyed by connection id, for later update/delete. */
+  externalEventIds: Record<string, string>
+  /**
+   * The meeting link the calendar provider minted (Google Meet / Teams), or
+   * null for a non-conference event type or before the calendar sync has
+   * run. Per-booking, not per-event-type: a reschedule creates a fresh
+   * external event and therefore a fresh link.
+   */
+  conferenceUrl: string | null
+  rescheduleOf: string | null
+  rescheduledTo: string | null
+  /** Rotated on reschedule so links in superseded emails die (ADR-0005 §4). */
+  manageTokenHash: string
+  cancelledAt: number | null
+  createdAt: number
+}
+
+export interface SlotHold {
+  id: string
+  eventTypeId: string
+  expiresAt: number
+  createdAt: number
+}
+
+// ---------------------------------------------------------------------------
+// Calendar connections
+// ---------------------------------------------------------------------------
+
+export type SyncStatus = 'ok' | 'needs_reconnect' | 'error'
+
+export interface CalendarConnection {
+  id: string
+  userId: string
+  provider: 'google' | 'microsoft'
+  providerAccountEmail: string
+  /** AES-GCM ciphertext; AAD binds userId|provider|connectionId (ADR-0005 §6). */
+  encryptedTokens: string
+  keyVersion: number
+  /** Which calendars count toward busy-ness. */
+  calendarIdsRead: string[]
+  /** Which calendar bookings are written to; null means do not write. */
+  calendarIdWrite: string | null
+  syncStatus: SyncStatus
+  createdAt: number
+}
+
+/** Shape inside `encryptedTokens` once decrypted. Never persisted in the clear. */
+export interface OAuthTokens {
+  accessToken: string
+  refreshToken: string
+  expiresAt: number
+  scope: string
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+export interface Session {
+  /** SHA-256 of the cookie value. The raw value is never stored. */
+  idHash: string
+  userId: string
+  expiresAt: number
+  absoluteExpiresAt: number
+  /** Last D1 write bookmark, so hosts never read a stale replica (ADR-0007 §2). */
+  bookmark: string | null
+  createdAt: number
+}
+
+export interface MagicLinkToken {
+  tokenHash: string
+  email: string
+  expiresAt: number
+  createdAt: number
+  /**
+   * The IANA zone the sign-in form's browser reported, validated before it
+   * is stored, or null when the form was submitted without script. It
+   * travels on the token because the link is redeemed in a different
+   * request — often on a different device — and the redeeming request's
+   * network location is the only other signal, which is what left every
+   * self-hosted host on UTC.
+   */
+  timezone?: string | null
+}
+
+export interface ApiKey {
+  id: string
+  userId: string
+  /** Stored in the clear so lookup is indexed rather than a table scan. */
+  prefix: string
+  hashSha256: string
+  name: string
+  scopes: string[]
+  lastUsedAt: number | null
+  createdAt: number
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------
+
+/**
+ * `booking.hosts_changed` fires when a co-host is added to or removed from
+ * a team booking from the dashboard; its payload carries `hostsAdded` and
+ * `hostsRemoved` next to the usual booking fields.
+ */
+export type WebhookEvent = 'booking.created' | 'booking.rescheduled' | 'booking.cancelled' | 'booking.hosts_changed'
+
+export interface Webhook {
+  id: string
+  userId: string
+  url: string
+  secret: string
+  events: WebhookEvent[]
+  active: boolean
+  createdAt: number
+}
+
+// ---------------------------------------------------------------------------
+// Slots
+// ---------------------------------------------------------------------------
+
+export interface Slot {
+  start: number
+  end: number
+  /**
+   * Hosts who can take this slot. One entry for personal and collective
+   * (collective requires all, so eligibility is all-or-nothing); for
+   * round-robin, everyone eligible — assignment happens at booking time, so
+   * listing a slot never reserves a host (ADR-0004 §5).
+   */
+  eligibleHostIds: string[]
+}

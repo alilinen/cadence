@@ -1,0 +1,134 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "cadence"
+main = "src/index.ts"
+compatibility_date = "2025-08-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Keep this alias in custom configs: Satori's font engine must use bundled WASM.
+[alias]
+harfbuzzjs = "./src/adapters/image/harfbuzz.ts"
+
+# Emscripten's CommonJS bootstrap needs a script path, even with static WASM.
+# These build-time constants avoid its browser-only self.location fallback.
+[define]
+__filename = '"/worker.js"'
+__dirname = '"/"'
+
+# See DEPLOYMENT.md for resource setup and first-admin sign-in.
+
+# Self-hosted OFL font files (docs/branding/brand.md), served directly by
+# Cloudflare's asset edge — never the Worker — so the brand typography loads
+# without a third-party font CDN call. Requests under /fonts/* are the only
+# ones this intercepts; everything else still falls through to the Worker
+# below. No `binding` because nothing in the Worker needs to fetch an asset
+# programmatically.
+[assets]
+directory = "./assets"
+
+# Cloudflare Email Service — the option with no API key at all, since the
+# binding itself is the credential and this file scopes it. Commented out
+# because it is opt-in. RESEND_API_KEY and BREVO_API_KEY take precedence
+# when set: the binding sends only when neither key is configured.
+#
+# Sending to guests — rather than only to verified destination addresses in
+# your own account — needs your sending domain onboarded under
+# Compute > Email Service > Email Sending, and a Workers Paid plan. FROM_EMAIL
+# must be an address on that onboarded domain. Until it is, guest sends fail
+# while /health still reads healthy, because a provider IS configured and the
+# "email is not configured" banner only fires for the console sender.
+#[[send_email]]
+#name = "EMAIL"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cadence"
+database_id = "<the id `wrangler d1 create cadence` printed>"
+migrations_dir = "migrations"
+
+# freeBusy cache (ADR-0006 §1) AND rendered OG card PNGs — two key
+# prefixes (`fb:`, `og:`) on one namespace, both non-authoritative and
+# re-derivable. Own bookings and holds are never stored here in either form —
+# KV propagates in "up to 60 seconds or more", which is unacceptable for the
+# writes users check immediately.
+[[kv_namespaces]]
+binding = "CACHE"
+id = "<the id `wrangler kv namespace create CACHE` printed>"
+
+# Optional file uploads. Hosted logo and favicon URLs work without R2.
+# To enable uploads, create the bucket and uncomment these three lines.
+# [[r2_buckets]]
+# binding = "AVATARS"
+# bucket_name = "cadence-avatars"
+
+[[durable_objects.bindings]]
+name = "HOST_CALENDAR"
+class_name = "HostCalendar"
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HostCalendar", "RateLimiter"]
+
+# Emails and webhooks. Both degrade gracefully when absent: the engine falls
+# back to inline delivery so a self-hoster without Queues still works.
+# Page and confirm views for the dashboard's Insights page. Workers
+# Analytics Engine is on the free plan; writes cost nothing per request.
+# Reading the numbers back needs INSIGHTS_API_TOKEN (Account Analytics:
+# Read) and CLOUDFLARE_ACCOUNT_ID — see docs/self-hosting.md; without
+# them Insights shows bookings only.
+[[analytics_engine_datasets]]
+binding = "INSIGHTS"
+dataset = "cadence_insights"
+
+[[queues.producers]]
+binding = "TASKS"
+queue = "cadence-tasks"
+
+[[queues.consumers]]
+queue = "cadence-tasks"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 5
+dead_letter_queue = "cadence-tasks-dlq"
+
+# Reminders at 24h and 1h, plus hold expiry and lock pruning.
+[triggers]
+crons = ["*/5 * * * *"]
+
+# Deployment template: replace resource placeholders and the values below.
+# Keep production account details in an ignored private configuration.
+[vars]
+# Before the first public deploy, set this to the intended administrator.
+# SIGNUPS = "admin@example.com"
+# Your Worker's public origin — the URL `wrangler deploy` prints, or your
+# custom domain. Used in every link the engine writes into emails and .ics.
+BASE_URL = "https://cadence.YOUR-SUBDOMAIN.workers.dev"
+BRAND_NAME = "Cadence"
+# Optional: the legal entity named on /privacy and /terms (defaults to
+# BRAND_NAME), and a live booking page to embed on your landing page.
+#LEGAL_OPERATOR = "Your Company Ltd"
+#DEMO_BOOKING_PATH = "/you/30min"
+FROM_EMAIL = "scheduling@your-domain.example"
+FROM_NAME = "Cadence"
+# Optional: name the email sender instead of inferring it from what is set
+# (RESEND_API_KEY, then BREVO_API_KEY, then the [[send_email]] binding, else
+# the console). Named, a missing key or binding is reported on /health and
+# the dashboard rather than quietly falling back to another sender.
+#EMAIL_PROVIDER = "cloudflare"   # cloudflare | resend | brevo | console
+SUPPORT_EMAIL = "you@your-domain.example"
+# Off unless explicitly enabled (ADR-0006 §5).
+TELEMETRY_ENABLED = "0"
+
+# Secrets — set with `wrangler secret put`, never in this file:
+#   ENCRYPTION_KEY_V1   base64 32 bytes, AES-GCM for refresh tokens at rest
+#   SIGNING_KEY         base64 32 bytes, HMAC for manage links
+#   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
+#   MICROSOFT_CLIENT_ID / MICROSOFT_CLIENT_SECRET
+#   RESEND_API_KEY / BREVO_API_KEY   (either; Resend wins if both are set —
+#                                      leave both unset to log emails to console)
