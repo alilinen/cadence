@@ -415,6 +415,8 @@ export interface BookingRepository {
    * still the right write for a delete, which has no link to record.
    */
   setSyncResult(bookingId: string, ids: Record<string, string>, conferenceUrl: string | null): Promise<void>
+  /** First writer wins, and only before a root booking's first confirmation. */
+  setInvitationIdentity(bookingId: string, uid: string, organizer: string): Promise<void>
   /**
    * Claim the right to send this booking's confirmation, exactly once.
    *
@@ -661,11 +663,16 @@ export interface CalendarProvider {
  */
 export interface CreatedEvent {
   id: string
+  invitationUid?: string
+  invitationOrganizer?: string
   /** Absent for a non-conference event type, or if the provider minted none. */
   conferenceUrl?: string
 }
 
 export interface ExternalEvent {
+  /** Set when an invitation already exists (e.g. recovery after a provider outage). */
+  invitationUid?: string
+  sequence?: number
   title: string
   description: string
   start: number

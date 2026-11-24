@@ -1,6 +1,7 @@
 import { isCalendarWrite, isReminder, reminderMinutes, type ActivityOperation } from '../../core/domain/booking-activity.js'
 import { canRecover } from '../../adapters/booking-activity.js'
 import type { ActivityRow } from '../../ports.js'
+import { version } from '../../../package.json'
 /**
  * The host dashboard (spec §5.1).
  *
@@ -2495,6 +2496,7 @@ export function settingsPage(d: SettingsPageData): string {
   ${channelsPanel({ csrf: d.csrf, action: '/dashboard/notifications', channels: d.channels, errorKey: 'channel', errors, draft: d.channelDraft, idPrefix: 'ch' })}
 </section>
 <p class="pu-platform-credit"><span>powered by</span> ${cadenceWordmark(true)}</p>
+<p class="pu-muted" style="font-size:.8125rem;margin:.375rem 0 0">Version ${escapeHtml(version)}</p>
 </section>` +
     shellBottom(d.brandName)
   )

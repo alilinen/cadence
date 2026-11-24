@@ -4,6 +4,7 @@ import { createD1Repositories } from '../../src/adapters/d1/repositories.js'
 import { applyBookingRevision, editBookingGuests } from '../../src/core/domain/booking-edits.js'
 import { reconcileGoogleBooking, reconcileGoogleCalendars } from '../../src/adapters/calendar-reconcile.js'
 import { icsSequenceForBooking, icsUidForBooking } from '../../src/core/ics.js'
+import { handleOne } from '../../src/adapters/queue/consumer.js'
 import { fakeConfig } from '../../src/testing/fakes.js'
 import { createWebCrypto } from '../../src/adapters/crypto/webcrypto.js'
 import { issueManageToken, verifyManageToken } from '../../src/core/domain/auth-flows.js'
@@ -848,4 +849,56 @@ describe('native mail timeout recovery', () => {
       expect(calls).toBe(1)
     },
   )
+})
+
+
+describe('shared invitation identity persistence', () => {
+  it('freezes the identity and never adopts a new UID for an already confirmed legacy booking', async () => {
+    await repos().bookings.setInvitationIdentity(booking.id,'native@google.com','organizer@example.com')
+    await repos().bookings.setInvitationIdentity(booking.id,'different@google.com','different@example.com')
+    expect(await reload()).toMatchObject({invitationUid:'native@google.com', invitationOrganizer:'organizer@example.com'})
+    await env.DB.prepare('UPDATE bookings SET invitation_uid=NULL, invitation_organizer=NULL WHERE id=?').bind(booking.id).run()
+    await repos().bookings.claimConfirmation(booking.id,NOW)
+    await repos().bookings.setInvitationIdentity(booking.id,'different@google.com','different@example.com')
+    expect((await reload()).invitationUid).toBeNull()
+  })
+
+  it('transfers one Google event through two reschedules, ignores stale deletes, and keeps the UID and Meet link', async () => {
+    await repos().bookings.setInvitationIdentity(booking.id,'shared-native@google.com',host.email)
+    const updates: Array<{id:string; sequence?:number}> = []
+    const deletes: string[] = []
+    const syncPorts = { ...ports, calendars: {get:()=>({
+      createEvent:async()=>{throw new Error('A reschedule must reuse its event')},
+      updateEvent:async(_conn: unknown,id:string,event:{sequence?:number})=>{updates.push({id,sequence:event.sequence})},
+      deleteEvent:async(_conn:unknown,id:string)=>{deletes.push(id)},
+    })}} as unknown as EnginePorts
+    let previous = await reload()
+    const root = previous
+    for (let i=1;i<=2;i++) {
+      const next = { ...previous, id:`b_identity_move_${i}`, startUtc:START+i*86_400_000, endUtc:END+i*86_400_000,
+        externalEventIds:{}, conferenceUrl:null, invitationUid:null, invitationOrganizer:null,
+        revision:0, rescheduleOf:previous.id, rescheduledTo:null, manageTokenHash:`move-${i}` }
+      await repos().bookings.createWithLocks(next,[])
+      expect(await repos().bookings.markRescheduled(previous.id,next.id)).toBe(true)
+      expect(await repos().bookings.markRescheduled(previous.id,next.id)).toBe(false)
+      expect((await repos().bookings.byId(previous.id))!.externalEventIds).toEqual({})
+      // Queue ordering is deliberately reversed: deletion arrives before update.
+      await handleOne({kind:'calendar.sync',bookingId:previous.id,action:'delete'},syncPorts)
+      queued.length=0
+      await handleOne({kind:'calendar.sync',bookingId:next.id,action:'create'},syncPorts)
+      previous = (await repos().bookings.byId(next.id))!
+      expect(previous).toMatchObject({invitationUid:root.invitationUid, invitationOrganizer:root.invitationOrganizer,
+        externalEventIds:root.externalEventIds,conferenceUrl:root.conferenceUrl})
+      const invites = invitations('booker@example.com')
+      expect(invites).toHaveLength(1)
+      expect(invites[0]).toContain('UID:shared-native@google.com')
+      expect(invites[0]).toContain(`SEQUENCE:${i}\r\n`)
+      expect(invites[0]).toContain('METHOD:REQUEST')
+    }
+    expect(updates).toEqual([{id:'google_event',sequence:1},{id:'google_event',sequence:2}])
+    expect(deletes).toEqual([])
+    await repos().bookings.cancelWithLockRelease(previous.id,NOW)
+    await handleOne({kind:'calendar.sync',bookingId:previous.id,action:'delete'},syncPorts)
+    expect(deletes).toEqual(['google_event'])
+  })
 })

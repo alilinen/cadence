@@ -163,13 +163,35 @@ export function createGoogleProvider(deps: CalendarProviderDeps): CalendarProvid
       url.searchParams.set('sendUpdates', 'none')
 
       const body = toGoogleEvent(event, requestId)
-      if (stable) body['id'] = stable.googleEventId
-      let res = await providerFetch(deps, conn, url.toString(), {
+      // Normal creation keeps the deterministic provider id. If an invitation
+      // already went out during an outage, its UID is frozen: supply iCalUID
+      // instead (Google forbids supplying both id and iCalUID).
+      if (event.invitationUid) body['iCalUID'] = event.invitationUid
+      else if (stable) body['id'] = stable.googleEventId
+      const findExistingInvitation = async (): Promise<Response | null> => {
+        const lookup = new URL(`${API}/calendars/${encodeURIComponent(calendarId)}/events`)
+        lookup.searchParams.set('iCalUID', event.invitationUid!)
+        lookup.searchParams.set('showDeleted', 'false')
+        const listed = await readJson<unknown>(conn, await providerFetch(deps, conn, lookup.toString()), 'events.list')
+        if (!isRecord(listed) || (listed['items'] !== undefined && !Array.isArray(listed['items'])) || listed['nextPageToken'])
+          throw new CalendarApiError('google', 'Incomplete UID lookup')
+        const matches = ((listed['items'] ?? []) as unknown[]).filter(isRecord).filter(e => e['iCalUID'] === event.invitationUid && e['status'] !== 'cancelled')
+        if (matches.length > 1) throw new CalendarApiError('google', 'Multiple events have the invitation UID; refusing another insert')
+        const found = matches[0]
+        if (!found) return null
+        if (!isRecord(found['organizer']) || found['organizer']['self'] !== true)
+          throw new CalendarApiError('google', 'The invitation belongs to another organizer')
+        return new Response(JSON.stringify(found), { headers: { 'content-type': 'application/json' } })
+      }
+      let res = event.invitationUid ? await findExistingInvitation() : null
+      if (!res) res = await providerFetch(deps, conn, url.toString(), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (res.status === 409 && stable) {
+      if (res.status === 409 && event.invitationUid) {
+        res = (await findExistingInvitation()) ?? res
+      } else if (res.status === 409 && stable) {
         // "The requested identifier already exists": an earlier attempt of
         // this same sync created it and died before recording the id. The
         // event on the calendar is the one wanted — read it back.
@@ -185,8 +207,13 @@ export function createGoogleProvider(deps: CalendarProviderDeps): CalendarProvid
           body: JSON.stringify(created).slice(0, 500),
         })
       }
+      const identity = {
+        ...(typeof created['iCalUID'] === 'string' ? { invitationUid: created['iCalUID'] } : {}),
+        ...(isRecord(created['organizer']) && typeof created['organizer']['email'] === 'string'
+          ? { invitationOrganizer: created['organizer']['email'] } : {}),
+      }
       const direct = googleConferenceUrl(created)
-      if (direct) return { id: created['id'], ...direct }
+      if (direct) return { id: created['id'], ...identity, ...direct }
 
       // Google provisions the Meet room asynchronously: `events.insert` can
       // return 200 with `conferenceData.createRequest.status` still
@@ -196,9 +223,9 @@ export function createGoogleProvider(deps: CalendarProviderDeps): CalendarProvid
       // and the guest got "link to follow" with nothing following.
       if (event.createConference === true) {
         const resolved = await resolveGoogleConference(deps, conn, calendarId, created['id'])
-        if (resolved) return { id: created['id'], ...resolved }
+        if (resolved) return { id: created['id'], ...identity, ...resolved }
       }
-      return { id: created['id'] }
+      return { id: created['id'], ...identity }
     },
 
     async updateEvent(conn, externalId, event) {
@@ -429,6 +456,7 @@ export function googleConferenceUrl(created: Record<string, unknown>): { confere
 export function toGoogleEvent(event: ExternalEvent, conferenceRequestId?: string): Record<string, unknown> {
   const body: Record<string, unknown> = {
     summary: event.title,
+    ...(event.sequence !== undefined ? { sequence: event.sequence } : {}),
     description: event.description,
     // Instants are already UTC; `timeZone` travels alongside so Google renders
     // and expands the event in the host's zone rather than the viewer's guess.

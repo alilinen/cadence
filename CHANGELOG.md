@@ -1,5 +1,11 @@
 # Cadence changes
 
+## 0.6.3 — 2026-11-24
+
+- Show the installed app version beneath the Cadence credit in Settings, including on custom-branded installations.
+- Use the Google Calendar event’s invitation identity in booking emails, preventing a second calendar entry when guests accept an emailed invite.
+- Keep the existing calendar event, invitation identity and meeting link across reschedules. Previously sent invitations retain their original identity.
+
 ## 0.6.2 — 2026-11-24
 
 - Choose whether guest edits notify everyone or only newly added participants. Removed guests still receive cancellations, and linked calendars continue to update.

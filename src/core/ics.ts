@@ -80,6 +80,7 @@ export function icsUid(bookingId: string, domain = 'cadence'): string {
 /** Only what UID/SEQUENCE resolution needs, so callers can pass partial rows. */
 export interface RescheduleLink {
   revision?: number
+  invitationUid?: string | null
   id: string
   rescheduleOf: string | null
 }
@@ -132,7 +133,8 @@ export function icsUidForBooking(
   chain: ReadonlyMap<string, RescheduleLink>,
   domain = 'cadence',
 ): string {
-  return icsUid(icsRootBookingId(booking, chain), domain)
+  const rootId = icsRootBookingId(booking, chain)
+  return booking.invitationUid ?? chain.get(rootId)?.invitationUid ?? icsUid(rootId, domain)
 }
 
 /**

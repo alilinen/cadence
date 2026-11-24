@@ -15,6 +15,7 @@ import { hostSettings } from '../../core/domain/hosts.js'
 import { channelAad, chatMessage, type ChannelConfig } from '../../core/domain/chat-notify.js'
 import { postChatMessage } from '../chat.js'
 import { needsReconnect } from '../oauth.js'
+import { icsUidForBooking, icsSequenceForBooking } from '../../core/ics.js'
 import { bookingGuests } from '../../core/domain/guests.js'
 import { DEFAULT_REMINDERS } from '../../core/domain/reminders.js'
 import { notifyBookingCreated, notifyBookingReminder, notifyBookingRescheduled } from '../notify.js'
@@ -327,6 +328,7 @@ export async function syncCalendar(
   // for a delete sync to run against a still-empty id map, delete nothing,
   // and leave a real calendar event nothing can ever remove.
   let googleWriteFailed = false
+  let identityPersistenceError: unknown
   const markSynced = async () => {
     if (!retry && !googleWriteFailed) await repos.bookings.markCalendarSynced(booking.id, booking.revision ?? 0)
   }
@@ -334,11 +336,22 @@ export async function syncCalendar(
 
   // One title and one description for every copy of this meeting, naming
   // the people and their companies (core/domain/calendar-text.ts).
+  const chain = new Map<string, Booking>()
+  let previousId = booking.rescheduleOf
+  while (previousId && !chain.has(previousId) && chain.size < 100) {
+    const previous = await repos.bookings.byId(previousId)
+    if (!previous) break
+    chain.set(previous.id, previous)
+    previousId = previous.rescheduleOf
+  }
+  const sequence = icsSequenceForBooking(booking, chain)
   const title = calendarTitle(eventType, plan.participants)
   const description = calendarDescription(eventType, booking, plan.participants)
   const externalFor = (conn: CalendarConnection, attendees: ExternalEvent['attendees']): ExternalEvent => ({
     title,
     description,
+    ...(booking.invitationUid ? { invitationUid: booking.invitationUid } : {}),
+    sequence,
     // One event per booking per connection (ADR-0011) is the identity the
     // providers key their idempotent creates on, so a redelivery of this
     // message after a failed `setSyncResult` finds the event, not a twin.
@@ -378,6 +391,17 @@ export async function syncCalendar(
         const result = await ports.calendars.get(conn.provider).createEvent(conn, external)
         // Keep the id: reschedule and cancel need it, and without it a
         // cancelled meeting stays on the host's real calendar forever.
+        if (conn.provider === 'google' && result.invitationUid && !booking.rescheduleOf) {
+          try {
+            await repos.bookings.setInvitationIdentity(booking.id, result.invitationUid,
+              result.invitationOrganizer ?? conn.providerAccountEmail)
+          } catch (error) {
+            // A provider event now exists. Never send a fallback UID if saving
+            // its identity failed; the idempotent retry must recover it first.
+            identityPersistenceError = error
+            throw error
+          }
+        }
         createdIds[conn.id] = result.id
         freshlyCreated.push({ conn, externalId: result.id })
         // Captured on the first event that mints one; `createConference`
@@ -411,6 +435,7 @@ export async function syncCalendar(
         }
       }
     }
+    if (identityPersistenceError) throw identityPersistenceError
   }
 
   /**
@@ -503,6 +528,14 @@ export async function syncCalendar(
     if (await abandonedIfCancelled()) return
     await repos.bookings.setSyncResult(booking.id, createdIds, conferenceUrl)
     await markSynced()
+    return
+  }
+
+  // Shared-identity reschedules inherit their existing events atomically in D1.
+  // Update those events instead of creating a new identity and deleting the old one.
+  if (booking.rescheduleOf && booking.invitationUid) {
+    await syncCalendar({ ...msg, action: 'update' }, ports)
+    await dispatchConfirmation(booking.id, ports, msg.manageToken)
     return
   }
 
@@ -662,7 +695,7 @@ export async function dispatchConfirmation(
 ): Promise<void> {
   const repos = ports.repositories({ consistency: 'bookmark' })
 
-  const booking = await repos.bookings.byId(bookingId)
+  let booking = await repos.bookings.byId(bookingId)
   if (!booking || booking.status !== 'confirmed') return
   const eventType = await repos.eventTypes.byId(booking.eventTypeId)
   if (!eventType) return
@@ -692,6 +725,12 @@ export async function dispatchConfirmation(
     // notification. Claiming first would burn the one claim on a pass that
     // deliberately sends nothing, and the reschedule mail would never go out.
     if (previous.rescheduledTo !== booking.id) return
+  }
+
+  if (!booking.rescheduleOf && !booking.invitationUid) {
+    await repos.bookings.setInvitationIdentity(booking.id,
+      icsUidForBooking(booking, new Map(), ports.config.invitationUidDomain), host.email)
+    booking = (await repos.bookings.byId(bookingId)) ?? booking
   }
 
   // Claimed as late as possible, but still before sending: Queues is

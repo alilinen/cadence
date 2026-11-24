@@ -261,11 +261,13 @@ export interface Booking {
   answers: Record<string, string>
   /** Provider event ids, keyed by connection id, for later update/delete. */
   externalEventIds: Record<string, string>
+  /** Frozen before the first invitation. Null on pre-shared-identity bookings. */
+  invitationUid?: string | null
+  invitationOrganizer?: string | null
   /**
    * The meeting link the calendar provider minted (Google Meet / Teams), or
    * null for a non-conference event type or before the calendar sync has
-   * run. Per-booking, not per-event-type: a reschedule creates a fresh
-   * external event and therefore a fresh link.
+   * run. Shared-identity reschedules transfer the existing event and link.
    */
   conferenceUrl: string | null
   rescheduleOf: string | null

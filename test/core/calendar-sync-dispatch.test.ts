@@ -18,6 +18,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Booking, CalendarConnection, EventType, EventTypeHost, User } from '../../src/core/domain/types.js'
 import type { EnginePorts, QueueMessage } from '../../src/ports.js'
+import { notifyBookingParticipantsChanged, notifyBookingCancelled } from '../../src/adapters/notify.js'
 import { handleOne } from '../../src/adapters/queue/consumer.js'
 
 const MEET = 'https://meet.google.com/abc-defg-hij'
@@ -134,6 +135,10 @@ function harness(opts: HarnessOptions = {}) {
     queue: { send: async (m: QueueMessage) => void queued.push(m) },
     repositories: () => ({
       bookings: {
+        async setInvitationIdentity(_id: string, uid: string, organizer: string) {
+          if (!claimed && !store.booking.invitationUid && !store.booking.rescheduleOf)
+            store.booking = { ...store.booking, invitationUid:uid, invitationOrganizer:organizer }
+        },
         async markCalendarSynced(_id: string, revision: number) {
           store.booking = { ...store.booking, calendarSyncRevision: revision }
         },
@@ -720,4 +725,54 @@ it('includes additional guests on synced provider events without duplicating a h
   const h = harness({ connectionsByUser: { u_host: [connection()] }, bookingPatch: { additionalGuests: ['extra@example.com', 'grace@example.com'] } })
   await handleOne(h.sync, h.ports)
   expect(attendeesOf(h.createEvent.mock.calls[0] as unknown[]).map((a) => a.email)).toEqual(['ada@example.com', 'extra@example.com', 'grace@example.com'])
+})
+
+
+describe('shared Google and emailed invitation identity', () => {
+  it('uses the provider UID for confirmation, new-only guest edits and cancellation', async () => {
+    const uid = 'native-event-identity@google.com'
+    const h = harness({ createEvent: async () => ({ id: 'native-event-identity', conferenceUrl: MEET, invitationUid: uid }) })
+    await handleOne(h.sync, h.ports)
+    const read = () => h.emails().map(m => ({ to: m.message.to, ics: m.message.attachments?.[0]
+      ? Buffer.from(m.message.attachments[0].content, 'base64').toString('utf8') : '' }))
+    expect(read().find(m => m.to === 'ada@example.com')?.ics).toContain(`UID:${uid}\r\n`)
+    const before = h.store.booking
+    h.store.booking = { ...before, additionalGuests: ['new@example.com'], revision: 1 }
+    h.queued.length = 0
+    await handleOne({ ...h.sync, action: 'update' }, h.ports)
+    await notifyBookingParticipantsChanged({ ports:h.ports, booking:h.store.booking, previous:before, host, eventType, notify:'new' })
+    expect(read().map(m => m.to)).toEqual(['new@example.com'])
+    expect(read()[0]?.ics).toContain(`UID:${uid}\r\n`)
+    expect(read()[0]?.ics).toContain('SEQUENCE:1\r\n')
+    h.queued.length = 0
+    h.store.booking = { ...h.store.booking, status:'cancelled' }
+    await notifyBookingCancelled({ ports:h.ports, booking:h.store.booking, host, eventType, cancelledBy: 'host' })
+    for (const mail of read().filter(m => m.to !== host.email)) {
+      expect(mail.ics).toContain(`UID:${uid}\r\n`)
+      expect(mail.ics).toContain('METHOD:CANCEL\r\n')
+      expect(mail.ics).toContain('SEQUENCE:2\r\n')
+    }
+  })
+})
+
+
+it('retries persistence after a provider create rather than sending a different fallback UID', async () => {
+  const h = harness({createEvent:async()=>({id:'native',invitationUid:'native@google.com',conferenceUrl:MEET})})
+  const repositories = h.ports.repositories.bind(h.ports)
+  let fail = true
+  h.ports.repositories = scope => {
+    const repos = repositories(scope)
+    const save = repos.bookings.setInvitationIdentity
+    repos.bookings.setInvitationIdentity = async (...args) => {
+      if(fail) throw new Error('identity write unavailable')
+      await save(...args)
+    }
+    return repos
+  }
+  await expect(handleOne(h.sync,h.ports)).rejects.toThrow('identity write unavailable')
+  expect(h.emails()).toEqual([])
+  fail=false
+  await handleOne(h.sync,h.ports)
+  expect(h.store.booking.invitationUid).toBe('native@google.com')
+  expect(h.emails()).toHaveLength(2)
 })

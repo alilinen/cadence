@@ -242,6 +242,8 @@ export const bookings = sqliteTable(
     externalEventIdsJson: text('external_event_ids_json').notNull().default('{}'),
     // The provider-minted meeting link for THIS booking.
     conferenceUrl: text('conference_url'),
+    invitationUid: text('invitation_uid'),
+    invitationOrganizer: text('invitation_organizer'),
     // Claimed by the calendar-sync handler to make the confirmation send
     // exactly-once across queue retries.
     confirmationQueuedAt: integer('confirmation_queued_at'),

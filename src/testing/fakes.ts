@@ -311,6 +311,11 @@ export function createFakeRepositories(): FakeRepositories {
         .sort((a, b) => (b.cancelledAt ?? b.startUtc) - (a.cancelledAt ?? a.startUtc))
         .slice(0, opts.limit)
     },
+    async setInvitationIdentity(bookingId: string, uid: string, organizer: string) {
+      const b = bookings.get(bookingId)
+      if (b && !confirmationClaims.has(bookingId) && !b.invitationUid && !b.rescheduleOf && b.status === 'confirmed')
+        bookings.set(bookingId, { ...b, invitationUid: uid, invitationOrganizer: organizer })
+    },
     async setExternalEventIds(bookingId: string, ids: Record<string, string>) {
       const existing = bookings.get(bookingId)
       if (existing) bookings.set(bookingId, { ...existing, externalEventIds: ids })

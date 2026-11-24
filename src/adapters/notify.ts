@@ -83,7 +83,7 @@ export async function notifyBookingCreated(ctx: NotifyContext): Promise<void> {
       method: 'REQUEST',
       booking,
       eventType,
-      organizer: { email: host.email, name: host.name || host.slug },
+      organizer: { email: booking.invitationOrganizer ?? host.email, name: host.name || host.slug },
       attendees: [
         ...bookingGuests(booking),
         ...(ctx.hosts ?? [host]).map((h) => ({ email: h.email, name: h.name || h.slug })),
@@ -392,7 +392,7 @@ async function buildAttachment(
       method,
       booking,
       eventType,
-      organizer: { email: host.email, name: host.name || host.slug },
+      organizer: { email: booking.invitationOrganizer ?? host.email, name: host.name || host.slug },
       attendees: [
         ...bookingGuests(booking),
         ...(hosts ?? [host]).map((h) => ({ email: h.email, name: h.name || h.slug })),

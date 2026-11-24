@@ -959,6 +959,21 @@ export function createD1Repositories(db: D1Database, scope: RequestScope): Repos
             "UPDATE bookings SET status = 'rescheduled', rescheduled_to = ? WHERE id = ? AND status = 'confirmed'",
           )
           .bind(newBookingId, bookingId),
+        // Move ownership of the SAME provider event to the winning replacement.
+        // A delayed delete for the superseded booking then sees no events to delete.
+        session.prepare(`UPDATE bookings SET
+          external_event_ids_json = (SELECT external_event_ids_json FROM bookings WHERE id = ?),
+          conference_url = (SELECT conference_url FROM bookings WHERE id = ?),
+          invitation_uid = (SELECT invitation_uid FROM bookings WHERE id = ?),
+          invitation_organizer = (SELECT invitation_organizer FROM bookings WHERE id = ?)
+          WHERE id = ? AND status = 'confirmed' AND invitation_uid IS NULL AND EXISTS (
+            SELECT 1 FROM bookings WHERE id = ? AND rescheduled_to = ? AND invitation_uid IS NOT NULL
+          )`).bind(bookingId, bookingId, bookingId, bookingId, newBookingId, bookingId, newBookingId),
+        session.prepare(`UPDATE bookings SET external_event_ids_json = '{}'
+          WHERE id = ? AND rescheduled_to = ? AND invitation_uid IS NOT NULL
+          AND EXISTS (SELECT 1 FROM bookings replacement WHERE replacement.id = ?
+            AND replacement.invitation_uid = bookings.invitation_uid AND replacement.status = 'confirmed')`)
+          .bind(bookingId, newBookingId, newBookingId),
         session.prepare('DELETE FROM slot_locks WHERE booking_id = ?').bind(bookingId),
       ])
       return (results[0]?.meta.changes ?? 0) > 0
@@ -983,6 +998,12 @@ export function createD1Repositories(db: D1Database, scope: RequestScope): Repos
         conferenceUrl,
         bookingId,
       )
+    },
+
+    async setInvitationIdentity(bookingId, uid, organizer) {
+      await run(`UPDATE bookings SET invitation_uid = ?, invitation_organizer = ?
+        WHERE id = ? AND invitation_uid IS NULL AND confirmation_queued_at IS NULL
+          AND reschedule_of IS NULL AND status = 'confirmed'`, uid, organizer, bookingId)
     },
 
     async claimConfirmation(bookingId, at) {
@@ -1937,6 +1958,8 @@ function mapBooking(row: Record<string, unknown> | null): Booking | null {
     answers: JSON.parse(String(row['answers_json'] ?? '{}')),
     externalEventIds: JSON.parse(String(row['external_event_ids_json'] ?? '{}')),
     conferenceUrl: row['conference_url'] == null ? null : String(row['conference_url']),
+    invitationUid: row['invitation_uid'] == null ? null : String(row['invitation_uid']),
+    invitationOrganizer: row['invitation_organizer'] == null ? null : String(row['invitation_organizer']),
     rescheduleOf: row['reschedule_of'] == null ? null : String(row['reschedule_of']),
     rescheduledTo: row['rescheduled_to'] == null ? null : String(row['rescheduled_to']),
     manageTokenHash: String(row['manage_token_hash']),

@@ -693,3 +693,42 @@ describe('shared-calendar event reads', () => {
     expect(hostile.calls.every(c=>c.url.startsWith('https://graph.microsoft.com/'))).toBe(true)
   })
 })
+
+
+describe('calendar invitation identities', () => {
+  const event = { title:'Identity test', description:'', start:1000, end:2000,
+    attendees:[{email:'guest@example.com'}], timezone:'UTC', idempotencyKey:'booking:connection' }
+  it('returns Google iCalUID and organizer verbatim, including idempotent read-back', async () => {
+    const { fetchImpl } = scriptGoogle([
+      [/\/events\?/, () => ({status:409, json:{error:'exists'}})],
+      [/\/events\//, () => ({json:{id:'rest-id', iCalUID:'calendar-uid@example.org', organizer:{email:'calendar@example.org'}, hangoutLink:'https://meet.google.com/one'}})],
+    ])
+    const result = await createGoogleProvider(deps(fetchImpl) as never).createEvent(connection(), event)
+    expect(result).toEqual({id:'rest-id', invitationUid:'calendar-uid@example.org', invitationOrganizer:'calendar@example.org', conferenceUrl:'https://meet.google.com/one'})
+  })
+  it('recovers an already emailed UID without creating another event on retry', async () => {
+    let remote: Record<string,unknown> | undefined
+    const { fetchImpl, calls } = scriptGoogle([
+      [/iCalUID=/, () => ({json:{items:remote ? [remote] : []}})],
+      [/\/events\?/, body => {
+        const sent = body as Record<string,unknown>
+        expect(sent.iCalUID).toBe('fallback@cadence')
+        expect(sent).not.toHaveProperty('id')
+        remote = {id:'recovered',iCalUID:sent.iCalUID,organizer:{email:'grace@example.com',self:true}}
+        return {json:remote}
+      }],
+    ])
+    const provider = createGoogleProvider(deps(fetchImpl) as never)
+    const first = await provider.createEvent(connection(),{...event,invitationUid:'fallback@cadence'})
+    const retry = await provider.createEvent(connection(),{...event,invitationUid:'fallback@cadence'})
+    expect(retry).toEqual(first)
+    expect(first.invitationUid).toBe('fallback@cadence')
+    expect(calls.filter(c=>c.method==='POST')).toHaveLength(1)
+  })
+  it('sends the invitation sequence to Google on updates', async () => {
+    const { fetchImpl,calls } = scriptGoogle([[/events/,()=>({json:{}})]])
+    await createGoogleProvider(deps(fetchImpl) as never).updateEvent(connection(),'existing',{...event,sequence:7})
+    expect(calls[0]!.body).toMatchObject({sequence:7})
+    expect(calls[0]!.url).toContain('sendUpdates=none')
+  })
+})
