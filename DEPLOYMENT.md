@@ -2,6 +2,10 @@
 
 For a demo or local development, start with the [README](README.md). Hosting requires your own Cloudflare account, Node.js 22.12 or later and a public hostname.
 
+## Upgrading
+
+For an existing installation, follow [Upgrading Cadence](UPGRADING.md) before deploying. It covers database migrations, preserving calendar invitation identities and configuration changes. Fresh installations should continue below; they do not need the legacy upgrade procedure.
+
 ## Before publishing the Worker
 
 1. Run `npm ci` and `npx wrangler login`. Copy `wrangler.toml` to an ignored `wrangler.production.toml` for a private deployment config, or edit the template in your own private checkout.

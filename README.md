@@ -48,6 +48,8 @@ npm run deploy
 
 Open `/login` on the deployed URL. Sign in as the intended administrator and check that **Admin** appears in the dashboard.
 
+Already running Cadence? Read the [upgrade guide](UPGRADING.md) before deploying a newer version. The [release notes](CHANGELOG.md) describe what changed in each version.
+
 ## Embed a booking page
 
 Create an event type in the dashboard, then use its public booking URL in an iframe or load the auto-resizing widget from your own installation.
