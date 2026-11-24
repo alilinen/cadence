@@ -702,6 +702,8 @@ describe('editing additional guests in the dashboard',()=>{
     const path=`/dashboard/bookings/${B_EDIT}`
     const html=await(await get(path,cookie)).text()
     expect(html).toContain('Edit guests')
+    expect(html).toContain('<option value="all" selected>Notify everyone</option>')
+    expect(html).toContain('<option value="new">Only notify new participants</option>')
     expect(html).toContain('name="revision" value="0"')
     const response=await post(`${path}/guests`,{csrf:await csrfFrom(path,cookie),revision:'0',guests:'guest2@example.test'},cookie)
     expect(response.status).toBe(302)
@@ -709,6 +711,17 @@ describe('editing additional guests in the dashboard',()=>{
     const saved=await createD1Repositories(db,{consistency:'bookmark'}).bookings.byId(B_EDIT)
     expect(saved?.additionalGuests).toEqual(['guest2@example.test'])
     expect(saved?.revision).toBe(1)
+  })
+  it('validates the notification choice and passes new-only mode to guest editing',async()=>{
+    const cookie=await seedSession(ALICE_ID)
+    const path=`/dashboard/bookings/${B_EDIT}`
+    const form={csrf:await csrfFrom(path,cookie),revision:'0',guests:'guest2@example.test',notify:'invalid'}
+    expect((await post(`${path}/guests`,form,cookie)).status).toBe(400)
+    expect(sent).toEqual([])
+    expect((await createD1Repositories(db,{consistency:'bookmark'}).bookings.byId(B_EDIT))?.revision).toBe(0)
+    expect((await post(`${path}/guests`,{...form,notify:'new'},cookie)).status).toBe(302)
+    expect(sent.filter((m)=>m.kind==='email').map((m)=>m.message.to)).toEqual(['guest2@example.test'])
+    expect(sent.some((m)=>m.kind==='calendar.sync' && m.action==='update')).toBe(true)
   })
   it('requires CSRF and booking access for both guest edits and manual sync',async()=>{
     const hostCookie=await seedSession(ALICE_ID)

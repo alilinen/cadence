@@ -1,6 +1,6 @@
 {
   "name": "cadence-scheduler",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Edge-native scheduling engine — the complete single-team product, on Cloudflare Workers",
   "license": "MIT",
   "type": "module",

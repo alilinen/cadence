@@ -225,6 +225,7 @@ async function sendBookingEmails(
   audience: ReminderRule['audience'] = 'both',
   deliver?: ClaimedMailDelivery,
   rule?: ReminderRule,
+  recipients?: ReadonlySet<string>,
 ): Promise<void> {
   const { ports, booking } = ctx
   const hosts = ctx.hosts ?? await notificationHosts(ctx)
@@ -232,6 +233,7 @@ async function sendBookingEmails(
   const sent = new Set<string>()
   const send = async (message: EmailMessage, role: ActivityRole, detail = '') => {
     const key = message.to.toLowerCase()
+    if (recipients && !recipients.has(key)) return
     if (sent.has(key)) return
     sent.add(key)
     await queueBookingMail(ports,booking,operation,message,role,detail || (message.attachments ? 'Calendar invitation attached' : ''),deliver,rule)
@@ -580,7 +582,7 @@ export async function notifyBookingReminder(ctx: NotifyContext, when: '24h' | '1
     (host) => bookingReminder({ ...shared, host, audience: 'host' }), typeof when === 'string' ? 'both' : when.audience, deliver, typeof when === 'string' ? {minutes: when === '24h' ? 1440 : 60,audience:'both'} : when)
 }
 
-export async function notifyBookingParticipantsChanged(ctx: NotifyContext & { previous: Booking }): Promise<void> {
+export async function notifyBookingParticipantsChanged(ctx: NotifyContext & { previous: Booking; notify?: 'all' | 'new' }): Promise<void> {
   const hosts = await notificationHosts(ctx)
   const { ports, booking, previous, eventType, host } = ctx
   const attachments = await buildAttachment(ports, booking, eventType, host, hosts, 'REQUEST')
@@ -589,6 +591,8 @@ export async function notifyBookingParticipantsChanged(ctx: NotifyContext & { pr
     bookingUrl: `${ports.config.baseUrl}/dashboard/bookings/${booking.id}` }
   const previousEmails = new Set(bookingGuests(previous).map((g) => g.email.toLowerCase()))
   const currentEmails = new Set(bookingGuests(booking).map((g) => g.email.toLowerCase()))
+  const recipients = ctx.notify === 'new'
+    ? new Set([...currentEmails].filter((email) => !previousEmails.has(email))) : undefined
   const manageUrl = ctx.manageToken
     ? `${ports.config.baseUrl}/booking/${booking.id}?token=${encodeURIComponent(ctx.manageToken)}` : undefined
   await sendBookingEmails({ ...ctx, hosts }, 'participants.updated', attachments,
@@ -596,7 +600,8 @@ export async function notifyBookingParticipantsChanged(ctx: NotifyContext & { pr
       ? bookingConfirmationForGuest({ ...shared, booking: guestBooking, hasAttachment: Boolean(attachments),
         ...(primary && manageUrl ? { rescheduleUrl: manageUrl, cancelUrl: manageUrl } : {}) })
       : bookingParticipantsChanged({ ...shared, booking: guestBooking, audience: 'guest', hasAttachment: Boolean(attachments) }),
-    (recipient, hasAttachment) => bookingParticipantsChanged({ ...shared, host: recipient, audience: 'host', hasAttachment }))
+    (recipient, hasAttachment) => bookingParticipantsChanged({ ...shared, host: recipient, audience: 'host', hasAttachment }),
+    'both', undefined, undefined, recipients)
   const removed = bookingGuests(previous).filter((g) => !currentEmails.has(g.email.toLowerCase()))
   // A removed guest's CANCEL must precede a later re-invitation, not consume its sequence.
   const cancelBooking = { ...previous, revision: Math.max(0, (booking.revision ?? 1) - 1) }

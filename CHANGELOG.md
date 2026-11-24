@@ -1,5 +1,9 @@
 # Cadence changes
 
+## 0.6.2 — 2026-11-24
+
+- Choose whether guest edits notify everyone or only newly added participants. Removed guests still receive cancellations, and linked calendars continue to update.
+
 ## 0.6.1 — 2026-11-22
 
 - Patch Satori, Hono, Zod and development-tooling security advisories, including Satori's pinned compression dependency.

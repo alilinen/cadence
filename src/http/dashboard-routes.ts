@@ -3369,8 +3369,10 @@ export function buildDashboardRoutes(ports: EnginePorts, slots: SlotService): Ap
     if (!access) return notFound(c)
     const revision = Number(form.get('revision'))
     if (!form.has('revision') || !Number.isSafeInteger(revision) || revision < 0) return c.text('Invalid booking revision', 400)
+    const notify = form.get('notify') ?? 'all'
+    if (notify !== 'all' && notify !== 'new') return c.text('Invalid notification choice', 400)
     const result = await editBookingGuests(ports, c.get('repos'), c.get('user'), {
-      bookingId: access.booking.id, revision, guests: form.get('guests') ?? '',
+      bookingId: access.booking.id, revision, guests: form.get('guests') ?? '', notify,
     })
     if (!result.ok) return c.html(hostBookingPage(await hostBookingPageData(c, access, { error: result.error })), 409)
     await advanceBookmark(c)

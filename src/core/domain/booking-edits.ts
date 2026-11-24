@@ -31,7 +31,7 @@ export async function applyBookingRevision(
 
 export async function editBookingGuests(
   ports: EnginePorts, repos: Repositories, actor: User,
-  input: { bookingId: string; revision: number; guests?: unknown; booker?: { name: unknown; email: unknown } },
+  input: { bookingId: string; revision: number; guests?: unknown; booker?: { name: unknown; email: unknown }; notify?: 'all' | 'new' },
 ): Promise<{ ok: true; booking: Booking } | { ok: false; error: string }> {
   const booking = await repos.bookings.byId(input.bookingId)
   const fail = (error: string) => ({ ok: false as const, error })
@@ -68,6 +68,7 @@ export async function editBookingGuests(
   await queueCalendarSync(ports, { kind: 'calendar.sync', bookingId: booking.id, action: 'update' }).catch(error => console.error('[cadence] calendar update failed to queue',error))
   const host = await repos.users.byId(updated.hostUserId)
   if (host) await notifyBookingParticipantsChanged({ ports, booking: updated, previous: booking, eventType, host,
+    notify: input.booker ? 'all' : input.notify,
     ...(issued ? { manageToken: issued.token } : {}) })
   return { ok: true, booking: updated }
 }

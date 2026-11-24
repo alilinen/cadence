@@ -64,6 +64,68 @@ beforeEach(async () => {
 })
 
 describe('dashboard participant edits', () => {
+  it('notifies only new guests when requested, preserving calendar sync and the meeting', async () => {
+    const before = await lockRows()
+    const result = await editBookingGuests(ports, repos(), host, {
+      bookingId: booking.id, revision: 0, guests: ['OLD@example.com', 'NEW@example.com', 'new@example.com'], notify: 'new',
+    })
+    expect(result.ok).toBe(true)
+    const messages = queued.filter((m) => m.kind === 'email')
+    expect(messages.map((m) => m.message.to)).toEqual(['new@example.com'])
+    expect(messages[0]!.message.text).not.toContain('?token=')
+    const invite = invitations('new@example.com')[0]!
+    expect(invite).toContain('METHOD:REQUEST')
+    expect(invite).toContain('SEQUENCE:1')
+    expect(invite).toContain('old@example.com')
+    expect(invite).toContain('booker@example.com')
+    expect(await reload()).toMatchObject({ startUtc: START, endUtc: END, conferenceUrl: booking.conferenceUrl,
+      externalEventIds: booking.externalEventIds, manageTokenHash: booking.manageTokenHash })
+    expect(await lockRows()).toEqual(before)
+    expect(queued.filter((m) => m.kind === 'calendar.sync')).toEqual([
+      { kind: 'calendar.sync', bookingId: booking.id, action: 'update' },
+    ])
+    const activity = await env.DB.prepare('SELECT target FROM booking_activity WHERE bookingId=? AND operation=?')
+      .bind(booking.id, 'participants.updated').all()
+    expect(activity.results.map((r) => r.target)).toEqual(['new@example.com'])
+  })
+
+  it('still cancels removed guests and gives returning guests a newer invitation in new-only mode', async () => {
+    const edit = (revision: number, guests: string[]) => editBookingGuests(ports, repos(), host,
+      { bookingId: booking.id, revision, guests, notify: 'new' })
+    expect((await edit(0, ['new@example.com'])).ok).toBe(true)
+    expect(queued.filter((m) => m.kind === 'email').map((m) => m.message.to).sort())
+      .toEqual(['new@example.com', 'old@example.com'])
+    const cancellation = invitations('old@example.com')[0]!
+    expect(cancellation).toContain('METHOD:CANCEL')
+    queued.length = 0
+    expect((await edit(1, ['new@example.com', 'old@example.com'])).ok).toBe(true)
+    expect(queued.filter((m) => m.kind === 'email').map((m) => m.message.to)).toEqual(['old@example.com'])
+    const returning = invitations('old@example.com')[0]!
+    expect(returning).toContain('METHOD:REQUEST')
+    expect(returning).toContain('SEQUENCE:2')
+    expect(returning.match(/UID:.+/)?.[0]).toBe(cancellation.match(/UID:.+/)?.[0])
+    queued.length = 0
+    expect((await edit(2, ['old@example.com', 'new@example.com'])).ok).toBe(true)
+    expect(queued).toEqual([])
+  })
+
+  it('keeps notifying everyone by default and does not persist a new-only choice', async () => {
+    await editBookingGuests(ports, repos(), host, { bookingId: booking.id, revision: 0,
+      guests: ['old@example.com', 'new@example.com'], notify: 'new' })
+    queued.length = 0
+    await guests(['old@example.com', 'new@example.com', 'another@example.com'])
+    expect(queued.filter((m) => m.kind === 'email').map((m) => m.message.to).sort())
+      .toEqual(['another@example.com', 'booker@example.com', 'host@example.com', 'new@example.com', 'old@example.com'])
+  })
+
+  it('only sends the necessary cancellation when new-only mode removes a guest without adding anyone', async () => {
+    expect((await editBookingGuests(ports, repos(), host, {
+      bookingId: booking.id, revision: 0, guests: [], notify: 'new',
+    })).ok).toBe(true)
+    expect(queued.filter((m) => m.kind === 'email').map((m) => m.message.to)).toEqual(['old@example.com'])
+    expect(invitations('old@example.com')[0]).toContain('METHOD:CANCEL')
+  })
+
   it('replaces the booker atomically, preserves the meeting and revokes the old management link', async () => {
     const locks=await lockRows()
     const result=await editBookingGuests(ports,repos(),host,{bookingId:booking.id,revision:0,booker:{name:' New Booker ',email:' New@Example.com '}})

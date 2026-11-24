@@ -70,6 +70,7 @@ For installations mounted at `/book`, include that prefix in both URLs. Guests c
 
 - Individual, collective and round-robin meetings, additional guests and optional hosts.
 - Dashboard meeting creation, rescheduling, cancellation, guest editing and booker replacement while preserving the meeting link.
+- When editing guests, notify everyone or only newly added participants. Removed guests always receive a cancellation; connected calendars still update.
 - Google Calendar and Microsoft 365 connections, availability checks and calendar invitations. Edits to recorded Google organizer events can update the booking.
 - Opt-in calendar sharing with named teammates. Owners select which calendars reveal titles. Private meetings and other availability conflicts appear as Busy.
 - Per-event reminder timing, audiences, editable subjects and messages, placeholders and email previews.

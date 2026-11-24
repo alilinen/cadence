@@ -3009,6 +3009,12 @@ ${d.error ? `<p class="pu-err" role="alert">${escapeHtml(d.error)}</p>` : ''}
         <label for="booking-guests">Additional guests</label>
         <textarea id="booking-guests" name="guests" rows="4" maxlength="2600" aria-describedby="booking-guests-help">${escapeHtml((b.additionalGuests ?? []).join('\n'))}</textarea>
         <p id="booking-guests-help" class="pu-muted">Add up to 10 email addresses, separated by commas or new lines. Remove an address to cancel that person's invitation. The original booker stays on the meeting.</p>
+        <label for="booking-guest-notify">Email notifications</label>
+        <select id="booking-guest-notify" name="notify" aria-describedby="booking-guest-notify-help">
+          <option value="all" selected>Notify everyone</option>
+          <option value="new">Only notify new participants</option>
+        </select>
+        <p id="booking-guest-notify-help" class="pu-muted">Choose who receives a booking email for this update. Removed guests always receive a cancellation. The meeting time and link stay the same. Your calendar provider may send its own updates.</p>
         <button class="pu-btn" type="submit">Save guests</button>
       </form>
     </details>` : ''}
