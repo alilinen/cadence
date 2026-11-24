@@ -18,7 +18,7 @@
  */
 export const RESERVED_SLUGS = new Set([
   // Live routes
-  'api', 'health', 'mcp', 'embed', 'embed.js', 'favicon.svg', 'robots.txt',
+  'brand', 'fonts', 'cadence-email.png', 'api', 'health', 'mcp', 'embed', 'embed.js', 'favicon.svg', 'robots.txt',
   'auth', 'login', 'logout', 'dashboard', 'booking', 'bookings', 'og', 'avatars',
   // Near-misses and likely future routes
   'admin', 'settings', 'account', 'billing', 'pricing', 'signup', 'signin',

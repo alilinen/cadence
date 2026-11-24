@@ -36,7 +36,7 @@ export async function notifyNewHosts(
     const schedule = host.scheduleId ? await repos.availability.byId(host.userId, host.scheduleId) : null
     const content = hostAddedEmail({
       brandName: ports.config.brandName,
-      ...await emailBranding(repos.settings, ports.config.baseUrl),
+      ...await emailBranding(repos.settings, ports.config.baseUrl, ports.config.assetBaseUrl),
       hostName: user.name || user.slug,
       eventTitle: eventType.title,
       teamName: team.name,

@@ -1,5 +1,12 @@
 # Cadence changes
 
+## 0.6.4 — 2026-11-24
+
+- Deploy at root or any URL-safe subpath using `BASE_URL`, without source patches. Forms, redirects, cookies, OAuth callbacks and bundled assets follow the configured path.
+- Optionally host CSS, scripts, fonts and built-in images using `ASSET_BASE_URL`; saved installation branding retains priority.
+- Resolve self-hosted favicon links without redirect loops.
+- Use Cadence-only session/OAuth cookies, webhook headers and new fallback invitation IDs. Existing installations with namespace overrides must preserve issued invitation IDs before removing those settings; users sign in again after the upgrade.
+
 ## 0.6.3 — 2026-11-24
 
 - Show the installed app version beneath the Cadence credit in Settings, including on custom-branded installations.

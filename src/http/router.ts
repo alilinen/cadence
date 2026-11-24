@@ -103,6 +103,9 @@ export function buildRouter(ports: EnginePorts, slots: SlotService): Hono<Router
     const hideUploads = !ports.blobStorage && c.req.path.startsWith('/dashboard')
     let dark = false
     const html = new HTMLRewriter()
+    if (ports.config.assetBaseUrl) html.on('meta[data-default-card]', { element(el) {
+      el.setAttribute('content', ports.config.assetBaseUrl + '/og/default.png')
+    } })
     html.on('html', { element(el) { dark = el.getAttribute('data-theme') === 'dark' } })
     html.on('[data-brand-home]', { element(el) { el.setAttribute('href', website ?? new URL(ports.config.baseUrl).origin + '/') } })
     if (hideUploads) html.on('[data-image-upload]', { element(el) { el.remove() } })

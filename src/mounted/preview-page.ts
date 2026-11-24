@@ -6,7 +6,6 @@ import { daysWithSlots, monthRange } from '../engine.js'
 import { clampMonth } from '../http/router.js'
 import { bookedConfirmation, confirmForm, errorPage, eventHeader, monthGrid, shellFoot, shellHead, slotList, type BookingPageData } from '../http/pages/booking.js'
 import type { EventType, User, WeeklySchedule } from '../core/domain/types.js'
-import { MOUNT } from './mount.js'
 
 export const DEMO_PATH = '/alex/demo'
 export const host: User = { id: 'cadence-preview', email: 'preview@example.invalid', name: 'Alex', tz: 'Europe/London', slug: 'alex', avatarKey: null, company: 'Cadence', jobTitle: null, companyUrl: null, role: 'admin', createdAt: 0 }
@@ -23,7 +22,7 @@ export const demoEvent: EventType = {
   active: true, createdAt: 0, scheduleId: null,
 }
 
-export function previewData(url: URL, now: number): BookingPageData {
+export function previewData(url: URL, now: number, mount = '/book'): BookingPageData {
   const param = url.searchParams
   const requestedZone = param.get('tz') ?? host.tz
   const zone = isValidTimeZone(requestedZone) ? requestedZone : host.tz
@@ -41,15 +40,15 @@ export function previewData(url: URL, now: number): BookingPageData {
   const selectedDate = /^\d{4}-\d{2}-\d{2}$/.test(requestedDate) && requestedDate.startsWith(month) ? requestedDate : slots[0] ? localDateString(slots[0].start, zone) : undefined
   return {
     host, eventType: demoEvent, ownerSlug: host.slug, brandName: 'Cadence', month,
-    guestTimezone: zone, baseUrl: `${url.origin}${MOUNT}`, daysWithSlots: daysWithSlots(slots, zone),
+    guestTimezone: zone, baseUrl: `${url.origin}${mount}`, daysWithSlots: daysWithSlots(slots, zone),
     selectedDate, slots: slots.filter(slot => localDateString(slot.start, zone) === selectedDate),
   }
 }
 
-export async function renderPreview(request: Request, now = Date.now()): Promise<Response> {
+export async function renderPreview(request: Request, now = Date.now(), mount = '/book'): Promise<Response> {
   const url = new URL(request.url)
   if (url.pathname === '/') {
-    url.pathname = `${MOUNT}${DEMO_PATH}`
+    url.pathname = `${mount}${DEMO_PATH}`
     return Response.redirect(url.href, 302)
   }
   if (url.pathname !== DEMO_PATH && url.pathname !== `${DEMO_PATH}/confirm`) return new Response('Not found', { status: 404 })
@@ -76,7 +75,7 @@ export async function renderPreview(request: Request, now = Date.now()): Promise
   }
   const zone = url.searchParams.get('tz') ?? host.tz
   if (url.pathname.endsWith('/confirm') && Number.isFinite(start) && start > 0) url.searchParams.set('date', localDateString(start, isValidTimeZone(zone) ? zone : host.tz))
-  const data = previewData(url, now)
+  const data = previewData(url, now, mount)
   let body: string
   if (url.pathname.endsWith('/confirm')) {
     if (!data.slots?.some(slot => slot.start === start)) return new Response(errorPage('Choose another time', 'That sample time is not available. Return to the calendar to choose a time.'), { status: 400, headers: { 'content-type': 'text/html; charset=utf-8' } })

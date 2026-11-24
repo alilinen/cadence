@@ -127,7 +127,7 @@ export function shellHead(chrome: PageChrome): string {
 <title>${escapeHtml(chrome.title)}</title>
 ${chrome.description ? `<meta name="description" content="${escapeHtml(chrome.description)}">` : ''}
 <meta name="color-scheme" content="light dark">
-<script src="/book/brand/theme.js"></script>
+<script src="/brand/theme.js"></script>
 <meta name="theme-color" content="${chrome.themeColor ?? '#111111'}">
 <link rel="icon" type="image/svg+xml" sizes="any" href="${CADENCE_FAVICON}">
 ${
@@ -152,9 +152,10 @@ ${chrome.description ? `<meta name="twitter:description" content="${escapeHtml(c
     : ''
 }
 <style>${pageCss()}</style>
-<link rel="stylesheet" href="/book/brand/cadence.css">
+<link rel="stylesheet" href="/brand/fonts.css">
+<link rel="stylesheet" href="/brand/cadence.css">
 ${colours ? `<style>${colours}</style>` : ''}
-${chrome.surface === 'calendar' ? '<script src="/book/brand/calendar-navigation.js" defer></script>' : ''}
+${chrome.surface === 'calendar' ? '<script src="/brand/calendar-navigation.js" defer></script>' : ''}
 </head>
 <body class="${chrome.surface === 'dashboard' ? 'cadence-dashboard' : 'cadence-booking'}"${appearance ? ` data-layout="${escapeHtml(appearance.layout)}"` : ''}>
 <a class="cadence-skip" href="#main">Skip to booking</a>

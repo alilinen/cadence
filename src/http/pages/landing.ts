@@ -107,9 +107,10 @@ ${analyticsTag(opts.analyticsId)}
 <meta name="twitter:title" content="${escapeHtml(opts.title)}">
 <meta name="twitter:description" content="${escapeHtml(opts.description)}">
 <meta data-default-card name="twitter:image" content="${escapeHtml(image)}">
-<script src="/book/brand/theme.js"></script>
+<script src="/brand/theme.js"></script>
 <style>${pageCss()}${LANDING_CSS}</style>
-<link rel="stylesheet" href="/book/brand/cadence.css">
+<link rel="stylesheet" href="/brand/fonts.css">
+<link rel="stylesheet" href="/brand/cadence.css">
 </head>
 <body>
 ${body}

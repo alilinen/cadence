@@ -9,6 +9,8 @@
  * `npm run migrate`, `wrangler deploy`.
  */
 
+import { normalizeBaseUrl, assetBaseUrl } from './core/urls.js'
+import { internalRequest, mountOptions, mountedResponse, staticResponse } from './mounted/mount.js'
 import { createEngine } from './engine.js'
 import { createD1Repositories } from './adapters/d1/repositories.js'
 import { createWebCrypto } from './adapters/crypto/webcrypto.js'
@@ -33,8 +35,11 @@ export { HostCalendar } from './do/host-calendar.js'
 export { RateLimiter } from './do/rate-limiter.js'
 
 export interface Env {
-  PROTOCOL_NAMESPACE?: string
-  INVITATION_UID_DOMAIN?: string
+  /** Optional static bundle CDN. Defaults to BASE_URL. */
+  ASSET_BASE_URL?: string
+  ASSETS?: Fetcher
+  /** Optional app-relative destination for the installation home. */
+  BOOKING_HOME_PATH?: string
   TELEMETRY_URL?: string
   DB: D1Database
   CACHE: KVNamespace
@@ -83,14 +88,19 @@ export interface Env {
 }
 
 export function buildPorts(env: Env): EnginePorts {
-  const baseUrl = env.BASE_URL ?? 'http://localhost:8787'
+  // Never silently change the UID of invitations sent by an earlier installation.
+  // Its operator must freeze those UIDs in booking data before removing the settings.
+  if ('PROTOCOL_NAMESPACE' in env || 'INVITATION_UID_DOMAIN' in env) {
+    throw new Error('Retired protocol settings: preserve existing invitation UIDs, then remove PROTOCOL_NAMESPACE and INVITATION_UID_DOMAIN before upgrading')
+  }
+  const baseUrl = normalizeBaseUrl(env.BASE_URL ?? 'http://localhost:8787')
   // Fail fast on the template's placeholder rather than quietly building
   // every magic-link, OAuth callback and manage URL against it — a deploy
   // whose links all dead-end is far harder to diagnose than this error.
   // The first deploy is when the real URL becomes known, so the guide's
   // flow is: deploy, copy the URL wrangler printed, set BASE_URL, deploy
   // again.
-  if (baseUrl.includes('YOUR-SUBDOMAIN')) {
+  if (baseUrl.toLowerCase().includes('your-subdomain')) {
     throw new Error(
       'BASE_URL in wrangler.toml is still the template placeholder. Set it to the URL ' +
         '`wrangler deploy` printed (or your custom domain) and deploy again — every link in ' +
@@ -208,6 +218,7 @@ export function buildPorts(env: Env): EnginePorts {
     }),
     config: {
       baseUrl,
+      assetBaseUrl: assetBaseUrl(baseUrl, env.ASSET_BASE_URL),
       brandName: env.BRAND_NAME ?? 'Cadence',
       ...(env.LEGAL_OPERATOR ? { legalOperator: env.LEGAL_OPERATOR } : {}),
       ...(env.DEMO_BOOKING_PATH ? { demoBookingPath: env.DEMO_BOOKING_PATH } : {}),
@@ -218,8 +229,6 @@ export function buildPorts(env: Env): EnginePorts {
       fromName: env.FROM_NAME ?? 'Cadence',
       emailDelivery,
       ...(emailProblem ? { emailProblem } : {}),
-      protocolNamespace: env.PROTOCOL_NAMESPACE,
-      invitationUidDomain: env.INVITATION_UID_DOMAIN,
       telemetryUrl: env.TELEMETRY_URL,
       telemetryEnabled: env.TELEMETRY_ENABLED === '1',
     },
@@ -239,8 +248,30 @@ export function buildPorts(env: Env): EnginePorts {
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const paths = mountOptions(env.BASE_URL ?? 'http://localhost:8787', env.ASSET_BASE_URL)
+    const internal = internalRequest(request, paths)
+    if (!internal) return new Response('Not found', { status: 404 })
+    const path = new URL(internal.url).pathname
+    if (path === '/' && env.BOOKING_HOME_PATH && ['GET', 'HEAD'].includes(request.method)) {
+      if (!/^\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/.test(env.BOOKING_HOME_PATH)) {
+        throw new Error('BOOKING_HOME_PATH must be an app-relative /owner/event path')
+      }
+      return Response.redirect(normalizeBaseUrl(env.BASE_URL) + env.BOOKING_HOME_PATH, 302)
+    }
+    const asset = await staticResponse(internal, env.ASSETS)
+    if (asset) return asset
     const engine = createEngine(buildPorts(env))
-    return engine.fetch(request, env, ctx)
+    const response = mountedResponse(await engine.fetch(internal, env, ctx), request, paths)
+    // An operator may link the favicon to a file in this very installation.
+    // Resolve that file through ASSETS instead of redirecting back to itself.
+    if (env.ASSETS && (path === '/favicon.ico' || path === '/favicon.svg') &&
+        ['GET', 'HEAD'].includes(request.method) && response.headers.has('location') &&
+        new URL(response.headers.get('location')!, request.url).href === request.url) {
+      const icon = await env.ASSETS.fetch(internal)
+      if (icon.status !== 404 && !icon.headers.get('content-type')?.includes('text/html')) return icon
+      return new Response('Favicon not found', { status: 404 })
+    }
+    return response
   },
 
   async queue(batch: MessageBatch, env: Env): Promise<void> {

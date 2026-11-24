@@ -960,8 +960,10 @@ export interface RateLimitResult {
 export type EmailDelivery = 'cloudflare' | 'resend' | 'brevo' | 'console'
 
 export interface EngineConfig {
-  /** Public origin, e.g. https://calendar.example — used in links and .ics URLs. */
+  /** Full public URL including any mount path — used in links and .ics URLs. */
   baseUrl: string
+  /** Public location of the bundled static assets, including email artwork. */
+  assetBaseUrl?: string
   brandName: string
   /**
    * The legal entity operating this deployment, named on /privacy and /terms
@@ -1003,8 +1005,6 @@ export interface EngineConfig {
    */
   emailProblem?: string
   /** Off unless explicitly enabled (ADR-0006 §5). */
-  protocolNamespace?: string
-  invitationUidDomain?: string
   telemetryUrl?: string
   telemetryEnabled: boolean
   /** Abuse-limit overrides; operator-tunable. */

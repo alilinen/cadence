@@ -50,7 +50,7 @@ export function appearancePage(chrome: DashboardChrome, teams: Team[], team: Tea
         <div class="pu-preview-stage"><iframe title="Booking page preview" name="appearance-preview" sandbox="allow-same-origin" src="${esc(action + (team ? '&' : '?') + 'sample=1')}"></iframe></div>
         <p class="pu-help" role="status" data-preview-status>Sample times. Changes go live when you publish.</p>
       </section>
-    </form><script src="/book/brand/appearance-editor.js" defer></script>` + shellBottom(chrome.brandName)
+    </form><script src="/brand/appearance-editor.js" defer></script>` + shellBottom(chrome.brandName)
 }
 
 export function appearanceSample(chrome: DashboardChrome, team: Team | null, appearance: BookingAppearance, example: EventType | undefined, now: number, previewTheme: 'light' | 'dark', logoSrc: string | undefined, identity: Pick<BookingPageData, 'host' | 'hosts' | 'companyLogo'>) {

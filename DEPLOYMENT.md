@@ -51,7 +51,37 @@ The default installation needs no R2 subscription. To additionally enable file u
 
 ## Existing applications
 
-Use the root Worker on a dedicated hostname or set `main = "src/mounted/worker.ts"` in a separate Wrangler configuration for a website's `/book` routes. The mounted entry needs an ASSETS binding with `directory = "./assets"` and `run_worker_first = true`. Set BASE_URL to the full public mount URL. Optionally set BOOKING_HOME_PATH to an event path such as `/team/intro`. Register OAuth redirects under the same mount.
+The standard `src/index.ts` Worker supports a dedicated hostname or any URL-safe subpath, including nested paths. Set `BASE_URL` to the full public location. No source edits or asset-folder copies are needed. The older `src/mounted/worker.ts` entry remains an alias for existing configurations.
+
+For example, merge these settings into your private Wrangler configuration:
+
+```toml
+main = "src/index.ts"
+routes = [
+  { pattern = "example.com/tools/calendar", zone_name = "example.com" },
+  { pattern = "example.com/tools/calendar/*", zone_name = "example.com" }
+]
+
+[assets]
+directory = "./assets"
+binding = "ASSETS"
+run_worker_first = true
+
+[vars]
+BASE_URL = "https://example.com/tools/calendar"
+# Optional: open a particular event at the installation home.
+BOOKING_HOME_PATH = "/team/intro"
+```
+
+Keep the other bindings, variables, secrets and triggers from the deployment template. Use both the exact route and the slash-prefixed wildcard so the home URL works without intercepting unrelated paths. Requests outside the configured mount return 404. For a dedicated hostname, omit the path from `BASE_URL` and use your normal domain or Workers URL configuration.
+
+Routes, form actions, session cookies, assets, email links and embed URLs use this location. Register OAuth callback URLs using the same base, for example `https://example.com/tools/calendar/auth/google/callback?purpose=calendar` and `?purpose=identity`. For local development, set `BASE_URL` in `.dev.vars` to the local origin and desired path; local variables override Wrangler's `[vars]`.
+
+### Optional asset hosting
+
+By default, CSS, scripts, fonts and built-in images load from the same mount as the app. To host the bundle elsewhere, set `ASSET_BASE_URL = "https://cdn.example.com/cadence"` in `[vars]` and publish the **contents** of `assets/` there. That URL must serve `brand/`, `fonts/`, `og/default.png` and `cadence-email.png`. Keep the CDN bundle in step with the Worker release, serve the correct MIME types and allow cross-origin font requests. Use a trusted HTTPS host: these files include executable scripts.
+
+The override affects only bundled assets. Uploaded images, custom logo/favicon URLs, authentication and booking routes stay at their configured locations. Linked images in Admin and Appearance continue to take priority over default branding.
 
 Keep live resource IDs, domains and credentials in local deployment configuration. Initialize the database and deploy with the same configuration.
 

@@ -104,7 +104,7 @@ export async function sendDigests(ports: EnginePorts, now: number): Promise<void
     if (meetings.length === 0) continue
     const mail = dailyDigestEmail({
       brandName: ports.config.brandName,
-      ...await emailBranding(repos.settings, ports.config.baseUrl),
+      ...await emailBranding(repos.settings, ports.config.baseUrl, ports.config.assetBaseUrl),
       ...(ports.config.supportEmail ? { supportEmail: ports.config.supportEmail } : {}),
       host,
       date,

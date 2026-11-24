@@ -22,7 +22,7 @@ npm ci
 npm run preview
 ```
 
-Open [the sample booking page](http://127.0.0.1:8790/book), choose a time and submit the form. **Preview complete** means you reached the end of the demo. It uses sample data and sends no email. To use another port, run `npm run preview -- --port 8791` and open that port instead.
+Open [the sample booking page](http://127.0.0.1:8790/book), choose a time and submit the form. **Preview complete** means you reached the end of the demo. It uses sample data and sends no email. To use another port, run `npm run preview -- --port 8791` and open that port instead. If you have set `BASE_URL` in `.dev.vars`, use its path instead of `/book`.
 
 ## Run locally
 
@@ -64,7 +64,7 @@ For **Follow website**, the widget reads the website’s root `data-theme`, `dat
 
 In **Admin**, set the main website URL for the top-left logo link. Its default is the installation’s main domain. The logo and browser icon each support an optional dark-theme image using either a hosted HTTPS URL or a file upload when image storage is enabled. Without a dark image, the default is used in both themes. Email and social previews continue to use the default logo.
 
-For installations mounted at `/book`, include that prefix in both URLs. Guests can book without an account. The dashboard, REST API and MCP server use the installation's own authentication.
+For a subpath installation, include the path from `BASE_URL` in both URLs. The standard Worker supports root and nested paths without source edits; see [deployment configuration](DEPLOYMENT.md#existing-applications). Guests can book without an account. The dashboard, REST API and MCP server use the installation's own authentication.
 
 ## What's included
 

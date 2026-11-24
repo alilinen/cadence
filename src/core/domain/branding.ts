@@ -47,8 +47,8 @@ export function logoPngPath(logo: CompanyLogo, baseUrl = ''): string {
   return baseUrl.replace(/\/$/, '') + '/avatars/' + encodeURIComponent(key.replace(/\.webp$/, '.png'))
 }
 
-export async function emailBranding(settings: SettingsRepository, baseUrl: string) {
+export async function emailBranding(settings: SettingsRepository, baseUrl: string, assetBaseUrl?: string) {
   // A cosmetic lookup must never prevent a sign-in or booking email.
   const branding = await readBranding(settings).catch(() => null)
-  return { baseUrl, logoUrl: branding?.logo ? logoPngPath(branding.logo, baseUrl) : undefined }
+  return { baseUrl, assetBaseUrl, logoUrl: branding?.logo ? logoPngPath(branding.logo, baseUrl) : undefined }
 }

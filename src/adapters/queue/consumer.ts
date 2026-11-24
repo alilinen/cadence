@@ -96,11 +96,11 @@ async function deliverWebhook(
   const timestamp = Math.floor(ports.clock.now() / 1000)
   const signature = await hmacHex(webhook.secret, `${timestamp}.${body}`)
 
-  const headers: Record<string, string> = { 'content-type': 'application/json' }
-  for (const name of new Set(['cadence', ports.config.protocolNamespace ?? 'cadence'])) {
-    headers[`x-${name}-event`] = msg.event
-    headers[`x-${name}-timestamp`] = String(timestamp)
-    headers[`x-${name}-signature`] = `sha256=${signature}`
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-cadence-event': msg.event,
+    'x-cadence-timestamp': String(timestamp),
+    'x-cadence-signature': `sha256=${signature}`,
   }
   const res = await fetch(webhook.url, {
     method: 'POST',
@@ -729,7 +729,7 @@ export async function dispatchConfirmation(
 
   if (!booking.rescheduleOf && !booking.invitationUid) {
     await repos.bookings.setInvitationIdentity(booking.id,
-      icsUidForBooking(booking, new Map(), ports.config.invitationUidDomain), host.email)
+      icsUidForBooking(booking, new Map()), host.email)
     booking = (await repos.bookings.byId(bookingId)) ?? booking
   }
 

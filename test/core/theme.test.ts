@@ -6,7 +6,7 @@ import { shellHead } from '../../src/http/pages/booking.js'
 import { embedScript } from '../../src/http/embed.js'
 import { CLASSIC } from '../../src/core/domain/appearance.js'
 
-const script = readFileSync(new URL('../../assets/book/brand/theme.js', import.meta.url), 'utf8')
+const script = readFileSync(new URL('../../assets/brand/theme.js', import.meta.url), 'utf8')
 function boot(mode: string, options: { saved?: string; query?: string; preview?: boolean } = {}) {
   const root = { dataset: { themeBehaviour: mode, theme: options.preview ? 'dark' : 'light' }, hasAttribute: () => !!options.preview }
   const listeners: Record<string, (e?: any) => void> = {}

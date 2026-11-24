@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { internalRequest, publicPath } from '../../src/mounted/mount.js'
+import { internalRequest as internal, publicPath as publicUrl } from '../../src/mounted/mount.js'
 import { previewData, renderPreview } from '../../src/mounted/preview-page.js'
 import { confirmForm, shellFoot, shellHead } from '../../src/http/pages/booking.js'
 import { formatQuestions, parseQuestions } from '../../src/http/pages/dashboard.js'
 import previewWorker from '../../src/mounted/preview.js'
+
+const publicPath = (value: string) => publicUrl(value, { mount: '/book' })
+const internalRequest = (request: Request) => internal(request, { mount: '/book' })
 
 const now = Date.parse('2026-10-28T08:00:00Z')
 
@@ -11,7 +14,7 @@ describe('Cadence booking boundary', () => {
   it('keeps app paths mounted, company links external and upstream manage URLs distinct', () => {
     expect(publicPath('/auth/google/callback')).toBe('/book/auth/google/callback')
     expect(publicPath('/booking/id?token=signed')).toBe('/book/booking/id?token=signed')
-    expect(publicPath('/book/brand/cadence.css')).toBe('/book/brand/cadence.css')
+    expect(publicPath('/brand/cadence.css')).toBe('/book/brand/cadence.css')
     expect(publicPath('https://organizer.example/')).toBe('https://organizer.example/')
     expect(publicPath('//external.example/path')).toBe('//external.example/path')
     expect(publicPath('#main')).toBe('#main')
@@ -31,9 +34,9 @@ describe('Cadence booking boundary', () => {
     const head = shellHead({ title: 'Book a demo', brandName: 'Cadence' })
     expect(head).toContain('class="cadence-wordmark"')
     expect(head).toContain('role="img" aria-label="Cadence"')
-    expect(head).toContain('href="/book/favicon.svg?v=common-time"')
-    expect(publicPath('/book/favicon.svg?v=common-time')).toBe('/book/favicon.svg?v=common-time')
-    expect(head).toContain('/book/brand/cadence.css')
+    expect(head).toContain('href="/brand/favicon.svg?v=common-time"')
+    expect(publicPath('/brand/favicon.svg?v=common-time')).toBe('/book/brand/favicon.svg?v=common-time')
+    expect(head).toContain('/brand/cadence.css')
     expect(head).not.toContain('rel="preload" href="/fonts/')
     expect(shellFoot(true)).toContain('href="/privacy"')
     expect(shellFoot(true, true)).toContain('postMessage')
@@ -70,7 +73,7 @@ describe('review-only booking flow', () => {
     expect(html).not.toContain('#cadence-times')
     expect(html).not.toContain('id="cadence-times" tabindex="-1"')
     expect(html).toContain('data-booking-calendar')
-    expect(html).toContain('/book/brand/calendar-navigation.js')
+    expect(html).toContain('/brand/calendar-navigation.js')
   })
 
   it('submits through the Worker entry without routing a form to the static asset server', async () => {

@@ -78,7 +78,7 @@ export async function notifyBookingCreated(ctx: NotifyContext): Promise<void> {
     // — not a shortcut, since `icsUidForBooking`/`icsSequenceForBooking`
     // require one explicitly rather than defaulting it away.
     ics = buildIcs({
-      uid: icsUidForBooking(booking, NO_CHAIN, ports.config.invitationUidDomain),
+      uid: icsUidForBooking(booking, NO_CHAIN),
       sequence: icsSequenceForBooking(booking, NO_CHAIN),
       method: 'REQUEST',
       booking,
@@ -115,7 +115,7 @@ export async function notifyBookingCreated(ctx: NotifyContext): Promise<void> {
     host,
     ...(ctx.hosts ? { hosts: ctx.hosts } : {}),
     brandName: ports.config.brandName,
-    ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl),
+    ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl, ports.config.assetBaseUrl),
     supportEmail: ports.config.supportEmail,
     ...(manageUrl ? { rescheduleUrl: manageUrl, cancelUrl: manageUrl } : {}),
     hasAttachment: Boolean(attachments),
@@ -177,7 +177,7 @@ export async function refreshInvitation(
     eventType,
     hosts,
     host,
-    ...(await emailBranding(repos.settings, ports.config.baseUrl)),
+    ...(await emailBranding(repos.settings, ports.config.baseUrl, ports.config.assetBaseUrl)),
     brandName: ports.config.brandName,
     supportEmail: ports.config.supportEmail,
     hasAttachment: Boolean(attachments),
@@ -387,7 +387,7 @@ async function buildAttachment(
   try {
     const chain = await loadChain(ports, booking)
     const ics = buildIcs({
-      uid: icsUidForBooking(booking, chain, ports.config.invitationUidDomain),
+      uid: icsUidForBooking(booking, chain),
       sequence: icsSequenceForBooking(booking, chain, method === 'CANCEL'),
       method,
       booking,
@@ -480,7 +480,7 @@ export async function notifyBookingCancelled(ctx: {
     ...(ctx.actor ? { cancelledByName: ctx.actor.name || ctx.actor.slug } : {}),
     ...(ctx.reason ? { reason: ctx.reason } : {}),
     brandName: ports.config.brandName,
-    ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl),
+    ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl, ports.config.assetBaseUrl),
     supportEmail: ports.config.supportEmail,
   }
 
@@ -539,7 +539,7 @@ export async function notifyBookingRescheduled(ctx: {
     ...(ctx.hosts ? { hosts: ctx.hosts } : {}),
     previous: { startUtc: ctx.previous.startUtc, endUtc: ctx.previous.endUtc },
     brandName: ports.config.brandName,
-    ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl),
+    ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl, ports.config.assetBaseUrl),
     supportEmail: ports.config.supportEmail,
     ...(manageUrl ? { rescheduleUrl: manageUrl, cancelUrl: manageUrl } : {}),
     hasAttachment: Boolean(attachments),
@@ -576,7 +576,7 @@ async function invitationText(
 
 export async function notifyBookingReminder(ctx: NotifyContext, when: '24h' | '1h' | ReminderRule, deliver?: ClaimedMailDelivery): Promise<void> {
   ctx = { ...ctx, hosts: await notificationHosts(ctx) }
-  const shared = { ...ctx, when, ...await emailBranding(ctx.ports.repositories({ consistency: 'unconstrained' }).settings, ctx.ports.config.baseUrl), brandName: ctx.ports.config.brandName, supportEmail: ctx.ports.config.supportEmail }
+  const shared = { ...ctx, when, ...await emailBranding(ctx.ports.repositories({ consistency: 'unconstrained' }).settings, ctx.ports.config.baseUrl, ctx.ports.config.assetBaseUrl), brandName: ctx.ports.config.brandName, supportEmail: ctx.ports.config.supportEmail }
   await sendBookingEmails(ctx, reminderOperation(typeof when === 'string' ? when : when.minutes), undefined,
     (booking) => bookingReminder({ ...shared, booking, audience: 'guest' }),
     (host) => bookingReminder({ ...shared, host, audience: 'host' }), typeof when === 'string' ? 'both' : when.audience, deliver, typeof when === 'string' ? {minutes: when === '24h' ? 1440 : 60,audience:'both'} : when)
@@ -587,7 +587,7 @@ export async function notifyBookingParticipantsChanged(ctx: NotifyContext & { pr
   const { ports, booking, previous, eventType, host } = ctx
   const attachments = await buildAttachment(ports, booking, eventType, host, hosts, 'REQUEST')
   const shared = { booking, eventType, host, hosts, brandName: ports.config.brandName,
-    supportEmail: ports.config.supportEmail, ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl),
+    supportEmail: ports.config.supportEmail, ...await emailBranding(ports.repositories({ consistency: 'unconstrained' }).settings, ports.config.baseUrl, ports.config.assetBaseUrl),
     bookingUrl: `${ports.config.baseUrl}/dashboard/bookings/${booking.id}` }
   const previousEmails = new Set(bookingGuests(previous).map((g) => g.email.toLowerCase()))
   const currentEmails = new Set(bookingGuests(booking).map((g) => g.email.toLowerCase()))

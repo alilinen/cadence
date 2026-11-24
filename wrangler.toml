@@ -16,14 +16,12 @@ __dirname = '"/"'
 
 # See DEPLOYMENT.md for resource setup and first-admin sign-in.
 
-# Self-hosted OFL font files (docs/branding/brand.md), served directly by
-# Cloudflare's asset edge — never the Worker — so the brand typography loads
-# without a third-party font CDN call. Requests under /fonts/* are the only
-# ones this intercepts; everything else still falls through to the Worker
-# below. No `binding` because nothing in the Worker needs to fetch an asset
-# programmatically.
+# The Worker routes both root and subpath installations using BASE_URL.
+# Bundled assets are resolved after the mount path is stripped.
 [assets]
 directory = "./assets"
+binding = "ASSETS"
+run_worker_first = true
 
 # Cloudflare Email Service — the option with no API key at all, since the
 # binding itself is the credential and this file scopes it. Commented out
@@ -106,9 +104,13 @@ crons = ["*/5 * * * *"]
 [vars]
 # Before the first public deploy, set this to the intended administrator.
 # SIGNUPS = "admin@example.com"
-# Your Worker's public origin — the URL `wrangler deploy` prints, or your
-# custom domain. Used in every link the engine writes into emails and .ics.
+# Full public URL, including an optional mount path such as /schedule.
+# Used for routes, cookies, OAuth callbacks and links in emails and .ics.
 BASE_URL = "https://cadence.YOUR-SUBDOMAIN.workers.dev"
+# Optional HTTPS CDN URL mirroring the contents of assets/.
+# ASSET_BASE_URL = "https://cdn.example.com/cadence"
+# Optional home redirect to an event, relative to BASE_URL.
+# BOOKING_HOME_PATH = "/you/30min"
 BRAND_NAME = "Cadence"
 # Optional: the legal entity named on /privacy and /terms (defaults to
 # BRAND_NAME), and a live booking page to embed on your landing page.

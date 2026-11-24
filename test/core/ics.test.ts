@@ -423,3 +423,20 @@ describe('in-place edits across later reschedules',()=>{
     expect(icsUidForBooking(movedAgain,chain)).toBe(icsUidForBooking(root,NO_CHAIN))
   })
 })
+
+
+describe('retiring an installation UID namespace', () => {
+  it.each(['original@previous-app', 'native@google.com'])('keeps saved %s through two moves and cancellation without an override', (uid) => {
+    const root = { id: 'original', rescheduleOf: null, invitationUid: uid }
+    const moved = { id: 'moved', rescheduleOf: root.id }
+    const again = { id: 'again', rescheduleOf: moved.id }
+    const chain = new Map<string, RescheduleLink>([[root.id, root], [moved.id, moved], [again.id, again]])
+    for (const [leg, method, sequence] of [[root, 'REQUEST', 0], [moved, 'REQUEST', 1], [again, 'REQUEST', 2], [again, 'CANCEL', 3]] as const) {
+      const doc = ics({}, { uid: icsUidForBooking(leg, chain), method, sequence: icsSequenceForBooking(leg, chain, method === 'CANCEL') })
+      expect(doc).toContain('UID:' + uid)
+      expect(doc).toContain('METHOD:' + method)
+      expect(doc).toContain('SEQUENCE:' + sequence)
+    }
+    expect(icsUidForBooking({ id: 'new', rescheduleOf: null }, new Map())).toBe('new@cadence')
+  })
+})

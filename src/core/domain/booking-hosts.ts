@@ -156,7 +156,7 @@ export async function changeBookingHosts(
   }
   const shared = {
     brandName: ports.config.brandName,
-    ...await emailBranding(repos.settings, ports.config.baseUrl),
+    ...await emailBranding(repos.settings, ports.config.baseUrl, ports.config.assetBaseUrl),
     eventTitle: eventType.title,
     guestName: booking.guestName,
     guestEmail: booking.guestEmail,

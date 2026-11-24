@@ -18,7 +18,7 @@ export const cadenceWordmark = (platformCredit = false) => `<svg xmlns="http://w
 
 export const CADENCE_LOGO = cadenceWordmark()
 
-export const CADENCE_FAVICON = '/book/favicon.svg?v=common-time'
+export const CADENCE_FAVICON = '/brand/favicon.svg?v=common-time'
 
 export function isCadenceBrand(brandName: string): boolean {
   return brandName.trim().toLowerCase() === 'cadence'

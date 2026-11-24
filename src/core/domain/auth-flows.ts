@@ -167,7 +167,7 @@ export async function requestMagicLink(
     to: email,
     ...magicLinkEmail({
       brandName: deps.config.brandName,
-      ...await emailBranding(deps.repos.settings, deps.config.baseUrl),
+      ...await emailBranding(deps.repos.settings, deps.config.baseUrl, deps.config.assetBaseUrl),
       supportEmail: deps.config.supportEmail,
       url: link,
       ip: req.ip,

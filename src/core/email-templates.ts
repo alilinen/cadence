@@ -60,6 +60,7 @@ export interface BookingEmailContext {
    * document base URL to resolve a relative one against.
    */
   baseUrl?: string
+  assetBaseUrl?: string
   logoUrl?: string
   /**
    * Whether the .ics is actually attached to THIS send. Defaults to true —
@@ -165,6 +166,7 @@ interface Cta {
 
 interface ShellInput {
   baseUrl?: string
+  assetBaseUrl?: string
   logoUrl?: string
   brandName: string
   /** The line inbox lists show after the subject. */
@@ -213,8 +215,9 @@ function ctaHtml(cta: Cta): string {
 
 function shell(input: ShellInput): string {
   const uploadedLogo = input.logoUrl && safeUrl(input.logoUrl)
-  const defaultLogo = input.brandName.trim().toLowerCase() === 'cadence' && input.baseUrl && safeUrl(input.baseUrl)
-    ? `${input.baseUrl.replace(/\/$/, '')}/cadence-email.png`
+  const assetBase = safeUrl(input.assetBaseUrl ?? input.baseUrl ?? '')
+  const defaultLogo = input.brandName.trim().toLowerCase() === 'cadence' && assetBase
+    ? `${assetBase.replace(/\/$/, '')}/cadence-email.png`
     : null
   const logoUrl = uploadedLogo || defaultLogo
   const logoSize = uploadedLogo ? 'height="36"' : 'width="158" height="24"'
@@ -405,7 +408,7 @@ export function bookingConfirmationForGuest(ctx: BookingEmailContext): EmailCont
   const brandName = brandOf(ctx)
   const input: ShellInput = {
     brandName,
-    baseUrl: ctx.baseUrl, logoUrl: ctx.logoUrl,
+    baseUrl: ctx.baseUrl, assetBaseUrl: ctx.assetBaseUrl, logoUrl: ctx.logoUrl,
     preheader: `${ctx.eventType.title} — ${formatWhenShort(ctx.booking.startUtc, tz)}`,
     heading: 'Your meeting is confirmed',
     intro:
@@ -435,7 +438,7 @@ export function bookingConfirmationForHost(ctx: BookingEmailContext): EmailConte
   const brandName = brandOf(ctx)
   const input: ShellInput = {
     brandName,
-    baseUrl: ctx.baseUrl, logoUrl: ctx.logoUrl,
+    baseUrl: ctx.baseUrl, assetBaseUrl: ctx.assetBaseUrl, logoUrl: ctx.logoUrl,
     preheader: `${ctx.booking.guestName} — ${formatWhenShort(ctx.booking.startUtc, tz)}`,
     heading: 'New booking',
     // Synced hosts get an informational email; a calendar attachment is the fallback.
@@ -479,7 +482,7 @@ export function bookingRescheduled(ctx: RescheduleEmailContext): EmailContent {
   const who = ctx.audience === 'guest' ? hostNames(ctx) : ctx.booking.guestName
   const input: ShellInput = {
     brandName,
-    baseUrl: ctx.baseUrl, logoUrl: ctx.logoUrl,
+    baseUrl: ctx.baseUrl, assetBaseUrl: ctx.assetBaseUrl, logoUrl: ctx.logoUrl,
     preheader: `New time: ${formatWhenShort(ctx.booking.startUtc, tz)}`,
     heading: 'Your meeting moved',
     intro:
@@ -537,7 +540,7 @@ export function bookingCancelled(ctx: CancellationEmailContext): EmailContent {
     : `${ctx.eventType.title} has been cancelled and removed from the calendar.`
   const input: ShellInput = {
     brandName,
-    baseUrl: ctx.baseUrl, logoUrl: ctx.logoUrl,
+    baseUrl: ctx.baseUrl, assetBaseUrl: ctx.assetBaseUrl, logoUrl: ctx.logoUrl,
     preheader: `${ctx.eventType.title} — ${formatWhenShort(ctx.booking.startUtc, tz)}`,
     heading: 'This meeting was cancelled',
     intro,
@@ -569,7 +572,7 @@ export function bookingReminder(ctx: ReminderEmailContext): EmailContent {
   const who = ctx.audience === 'guest' ? hostNames(ctx) : ctx.booking.guestName
   const input: ShellInput = {
     brandName,
-    baseUrl: ctx.baseUrl, logoUrl: ctx.logoUrl,
+    baseUrl: ctx.baseUrl, assetBaseUrl: ctx.assetBaseUrl, logoUrl: ctx.logoUrl,
     preheader: `${ctx.eventType.title} ${lead} — ${formatWhenShort(ctx.booking.startUtc, tz)}`,
     heading: rule.minutes === 1440 ? 'Your meeting is tomorrow' : `Your meeting starts ${lead}`,
     intro: 'message' in rule && rule.message ? fill(rule.message) : `A reminder that ${ctx.eventType.title} with ${who} starts ${lead}.`,
@@ -583,6 +586,7 @@ export function bookingReminder(ctx: ReminderEmailContext): EmailContent {
 
 export interface HostAddedInput {
   baseUrl?: string
+  assetBaseUrl?: string
   logoUrl?: string
   brandName: string
   hostName: string
@@ -615,7 +619,7 @@ export function hostAddedEmail(input: HostAddedInput): EmailContent {
       : 'Round robin — bookings rotate among the hosts'
   const shellInput: ShellInput = {
     brandName: input.brandName,
-    baseUrl: input.baseUrl, logoUrl: input.logoUrl,
+    baseUrl: input.baseUrl, assetBaseUrl: input.assetBaseUrl, logoUrl: input.logoUrl,
     preheader: `${input.editorName} added you as a host on ${input.eventTitle}.`,
     heading: `You're a host on ${input.eventTitle}`,
     intro: `${input.editorName} added you as a host on "${input.eventTitle}", a ${input.teamName} event type. Slots use ${input.scheduleName ? `your "${input.scheduleName}" schedule` : 'your default schedule'}.`,
@@ -635,6 +639,7 @@ export function hostAddedEmail(input: HostAddedInput): EmailContent {
 
 export interface BookingHostChangeInput {
   baseUrl?: string
+  assetBaseUrl?: string
   logoUrl?: string
   brandName: string
   /** The recipient — the host being put on or taken off the booking. */
@@ -672,7 +677,7 @@ function bookingHostChangeRows(input: BookingHostChangeInput): DetailRow[] {
 export function hostAddedToBookingEmail(input: BookingHostChangeInput): EmailContent {
   const shellInput: ShellInput = {
     brandName: input.brandName,
-    baseUrl: input.baseUrl, logoUrl: input.logoUrl,
+    baseUrl: input.baseUrl, assetBaseUrl: input.assetBaseUrl, logoUrl: input.logoUrl,
     preheader: `${input.editorName} added you to ${input.eventTitle} with ${input.guestName}.`,
     heading: `You've been added to a booking`,
     intro: `${input.editorName} added you as a host on "${input.eventTitle}" with ${input.guestName}. The calendar invitation follows separately.`,
@@ -694,7 +699,7 @@ export function hostAddedToBookingEmail(input: BookingHostChangeInput): EmailCon
 export function hostRemovedFromBookingEmail(input: BookingHostChangeInput): EmailContent {
   const shellInput: ShellInput = {
     brandName: input.brandName,
-    baseUrl: input.baseUrl, logoUrl: input.logoUrl,
+    baseUrl: input.baseUrl, assetBaseUrl: input.assetBaseUrl, logoUrl: input.logoUrl,
     preheader: `${input.editorName} took you off ${input.eventTitle} with ${input.guestName}.`,
     heading: `You've been taken off a booking`,
     intro: `${input.editorName} took you off "${input.eventTitle}" with ${input.guestName}. The meeting goes ahead with the hosts below; nothing is expected of you.`,
@@ -711,6 +716,7 @@ export function hostRemovedFromBookingEmail(input: BookingHostChangeInput): Emai
 
 export interface MagicLinkInput {
   baseUrl?: string
+  assetBaseUrl?: string
   logoUrl?: string
   url: string
   /** The IP that asked for the link. ADR-0005 §3 requires it in the body. */
@@ -734,7 +740,7 @@ export function magicLinkEmail(input: MagicLinkInput): EmailContent {
   const brandName = input.brandName ?? 'Cadence'
   const shellInput: ShellInput = {
     brandName,
-    baseUrl: input.baseUrl, logoUrl: input.logoUrl,
+    baseUrl: input.baseUrl, assetBaseUrl: input.assetBaseUrl, logoUrl: input.logoUrl,
     preheader: `Your sign-in link expires in ${input.expiresMinutes} minutes.`,
     heading: `Sign in to ${brandName}`,
     intro: `Click the button below to sign in. The link works once and expires in ${input.expiresMinutes} minutes.`,
@@ -759,6 +765,7 @@ export function magicLinkEmail(input: MagicLinkInput): EmailContent {
 
 export interface DigestEmailInput {
   baseUrl?: string
+  assetBaseUrl?: string
   logoUrl?: string
   brandName: string
   supportEmail?: string
@@ -783,7 +790,7 @@ export function dailyDigestEmail(input: DigestEmailInput): EmailContent {
   }))
   const shellInput: ShellInput = {
     brandName: input.brandName,
-    baseUrl: input.baseUrl, logoUrl: input.logoUrl,
+    baseUrl: input.baseUrl, assetBaseUrl: input.assetBaseUrl, logoUrl: input.logoUrl,
     preheader: `${n} ${n === 1 ? 'meeting' : 'meetings'} today`,
     heading: `Today: ${n} ${n === 1 ? 'meeting' : 'meetings'}`,
     intro: `${dayLabel}. Your confirmed meetings, in ${tz}.`,
@@ -802,7 +809,7 @@ export function bookingParticipantsChanged(ctx: BookingEmailContext & { audience
   const tz = zoneFor(ctx, ctx.audience)
   const heading = ctx.removed ? "You're no longer on this meeting" : 'The meeting guest list changed'
   return render({
-    brandName: brandOf(ctx), baseUrl: ctx.baseUrl, logoUrl: ctx.logoUrl, preheader: `${ctx.eventType.title} — ${formatWhenShort(ctx.booking.startUtc, tz)}`,
+    brandName: brandOf(ctx), baseUrl: ctx.baseUrl, assetBaseUrl: ctx.assetBaseUrl, logoUrl: ctx.logoUrl, preheader: `${ctx.eventType.title} — ${formatWhenShort(ctx.booking.startUtc, tz)}`,
     heading,
     intro: ctx.removed
       ? `You were removed from this meeting.${ctx.hasAttachment ? ' The attached cancellation removes it from your calendar.' : ''}`

@@ -194,9 +194,8 @@ export function buildDashboardRoutes(ports: EnginePorts, slots: SlotService): Ap
   // DashboardChrome literal below — see emailWarningBanner in pages/dashboard.ts.
   const emailDelivery = ports.config.emailDelivery
   const emailProblem = ports.config.emailProblem
-  const namespace = ports.config.protocolNamespace
-  const sessionName = namespace ? namespace + '_session' : SESSION_COOKIE_NAME
-  const oauthName = (namespace ?? 'cadence') + '_oauth'
+  const sessionName = SESSION_COOKIE_NAME
+  const oauthName = 'cadence_oauth'
   const secureCookies = ports.config.baseUrl.startsWith('https://')
   const hash = (value: string): Promise<string> => ports.crypto.hash(value)
 
@@ -1104,7 +1103,7 @@ export function buildDashboardRoutes(ports: EnginePorts, slots: SlotService): Ap
     const preview = /^preview-(guest|host)-(\d+)$/.exec(intent)
     if (preview && rules[Number(preview[2])]) {
       const i = Number(preview[2])
-      const mail = sampleReminder(chrome(c), et, rules[i]!, preview[1] === 'host' ? 'host' : 'guest', ports.clock.now() + rules[i]!.minutes * 60_000, await emailBranding(c.get('repos').settings, ports.config.baseUrl))
+      const mail = sampleReminder(chrome(c), et, rules[i]!, preview[1] === 'host' ? 'host' : 'guest', ports.clock.now() + rules[i]!.minutes * 60_000, await emailBranding(c.get('repos').settings, ports.config.baseUrl, ports.config.assetBaseUrl))
       return c.html(remindersPage(chrome(c), et, rules, version, { preview: mail, open: i }))
     }
     if (intent !== 'save') return c.text('Unknown reminder action.', 400)

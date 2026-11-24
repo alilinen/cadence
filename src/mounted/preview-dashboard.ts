@@ -2,16 +2,15 @@
 import { createMeetingPage } from '../http/pages/create-meeting.js'
 import { apiKeysPage, hostBookingPage, bookingsPage, connectionsPage, dashboardHome, schedulesPage, settingsPage, teamsPage } from '../http/pages/dashboard.js'
 import { demoEvent, host } from './preview-page.js'
-import { MOUNT } from './mount.js'
 import type { Schedule } from '../core/domain/types.js'
 
-export function previewDashboard(url: URL): Response {
+export function previewDashboard(url: URL, mount = '/book'): Response {
   if (!url.pathname.startsWith('/dashboard')) return new Response('Not found', { status: 404 })
   const chrome = { brandName: 'Cadence', user: host, csrf: 'preview-only', emailDelivery: 'cloudflare' as const }
   const hours = [{ startMinute: 540, endMinute: 1020 }]
   const schedule: Schedule = { id: 'preview-hours', userId: host.id, name: 'Working hours', timezone: host.tz,
     isDefault: true, weekly: [[], hours, hours, hours, hours, hours, []], overrides: [] }
-  const baseUrl = `${url.origin}${MOUNT}`
+  const baseUrl = `${url.origin}${mount}`
   const poolEvent = { ...demoEvent, id: 'cadence-pool-preview', title: 'Team introduction', schedulingType: 'round_robin' as const, ownerUserId: null, ownerTeamId: 'sample-team' }
   let html: string
   switch (url.pathname) {

@@ -472,3 +472,10 @@ describe('magicLinkEmail — ADR-0005 §3', () => {
     expect(mail.html).toContain('https://cadence.example/auth/callback?token=abc123')
   })
 })
+
+
+it('uses configured asset hosting for default email artwork while custom logos take priority', () => {
+  const options = ctx({ baseUrl: 'https://app.example/tools/calendar', assetBaseUrl: 'https://cdn.example/release' })
+  expect(bookingConfirmationForGuest(options).html).toContain('src="https://cdn.example/release/cadence-email.png"')
+  expect(bookingConfirmationForGuest({ ...options, logoUrl: 'https://images.example/custom.png' }).html).toContain('src="https://images.example/custom.png"')
+})

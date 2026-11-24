@@ -15,7 +15,7 @@ export function readReminderRules(form: FormData): ReminderRule[] {
   }))
 }
 
-export function sampleReminder(chrome: DashboardChrome, eventType: EventType, rule: ReminderRule, audience: EmailAudience, start: number, branding: { baseUrl: string; logoUrl?: string }) {
+export function sampleReminder(chrome: DashboardChrome, eventType: EventType, rule: ReminderRule, audience: EmailAudience, start: number, branding: { baseUrl: string; assetBaseUrl?: string; logoUrl?: string }) {
   const booking: Booking = {
     id: 'preview', eventTypeId: eventType.id, hostUserId: chrome.user.id, hostUserIds: [chrome.user.id],
     guestName: 'Alex Morgan', guestEmail: 'alex@example.invalid', guestTimezone: chrome.user.tz,
