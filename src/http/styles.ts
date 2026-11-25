@@ -391,6 +391,18 @@ label{display:block;font-size:.875rem;font-weight:600;margin:1rem 0 .35rem}
 input,select,textarea{width:100%;padding:.65rem .75rem;border:1px solid var(--pu-field-border);
   border-radius:var(--pu-radius);background:var(--pu-paper);color:var(--pu-ink-950);
   font:inherit;transition:border-color .12s ease}
+/* Native select arrows ignore padding in some browsers. Keep the native
+   picker, but draw an inset, theme-aware caret and reserve room for it.
+   The booking timezone picker already has its own wrapper/offset caret. */
+select:not([multiple]):not([size]):not(.pu-tz-select){
+  appearance:none;-webkit-appearance:none;padding-right:2.5rem;
+  background-image:linear-gradient(45deg,transparent 40%,var(--pu-text-secondary) 40%,var(--pu-text-secondary) 60%,transparent 60%),
+    linear-gradient(135deg,transparent 40%,var(--pu-text-secondary) 40%,var(--pu-text-secondary) 60%,transparent 60%);
+  background-position:right 1.125rem center,right .75rem center;
+  background-size:.375rem .375rem;background-repeat:no-repeat}
+@media(forced-colors:active){
+  select:not([multiple]):not([size]):not(.pu-tz-select){appearance:auto;-webkit-appearance:auto;background-image:none}
+}
 /* Without this the browser paints ticks and radios in its own accent — a
    blue that is the one hue the brand never uses. --pu-green-fill, not
    --pu-green-700: the tick is white on the fill, same contrast rule as

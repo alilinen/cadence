@@ -47,6 +47,27 @@ npx wrangler d1 execute DB --remote --command "INSERT INTO instance_settings (ke
 
 Use the same deployment config for that command. Remove `SIGNUPS` from the config and redeploy. Existing accounts can sign in. **Admin → Signups** can now admit other users. Before sharing a public link, confirm your timezone and hours, make a test booking, check its email and meeting location, then reschedule and cancel.
 
+## Google Calendar OAuth
+
+Create your own Google Cloud project, enable the Google Calendar API, and configure **Google Auth Platform → Branding, Audience and Clients**.
+
+For calendars from different Google Workspace organisations or personal Gmail accounts, set **Audience → User type: External** and **Publishing status: In production**. **Internal** only allows accounts within the project's Google Workspace organisation; external accounts will see “Access blocked … can only be used within its organisation”. This applies to **Connect another calendar**, even when the person is already signed in to Cadence.
+
+Complete Branding with your app name, support email, homepage, privacy policy, terms and authorised domain before publishing. If Google disables the production option, check for missing Branding fields. Cadence provides `/privacy` and `/terms` beneath your `BASE_URL`; review their contents for your installation before using them. Create a **Web application** OAuth client and register both exact callback URLs, including your mount path:
+
+```text
+<BASE_URL>/auth/google/callback?purpose=identity
+<BASE_URL>/auth/google/callback?purpose=calendar
+```
+
+Store `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` with `npx wrangler secret put`, using your deployment config. In Cadence, open **Calendars → Connect another calendar**, select which calendars to check for conflicts, and choose **Do not write events** for a connection used only for availability.
+
+Use **External + Testing** for development with explicitly listed test users. For Calendar access, Testing normally gives refresh tokens a seven-day lifetime, so it is unsuitable for ongoing production connections. After changing to production, reconnect accounts whose testing credentials have expired.
+
+**In production is not the same as verified.** Calendar permissions are sensitive. An unverified external app can still show Google's warning and is subject to a user cap; complete Google's verification requirements before offering it broadly. Workspace administrators can also restrict access. See [Google's OAuth production guidance](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview) and [refresh-token expiration rules](https://developers.google.com/identity/protocols/oauth2#expiration).
+
+These Google settings do not change Cadence's signup policy. Keep your intended email/domain allowlist in **Admin → Signups** (or `SIGNUPS`). Existing users can connect an authorised external calendar without admitting that calendar account as a new Cadence user.
+
 ## Logos and favicons
 
 In **Admin**, paste a direct HTTPS image URL for the company logo and a separate URL for the browser icon. Personal and team booking links can override the logo under **Appearance**; event types can also have their own logo. Use a stable, publicly accessible URL with no login or expiry. A PNG logo works well in email clients. Cadence stores the URL in D1. Visitors, email clients and social crawlers load the image from its host.

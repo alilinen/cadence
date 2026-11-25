@@ -2,6 +2,13 @@
 
 For existing installations, follow the [upgrade guide](UPGRADING.md). You can upgrade directly to the latest version; apply every pending database migration before deploying.
 
+## 0.6.5 — 2026-11-25
+
+- Explain how to configure Google OAuth as External and In production when connecting calendars from other organisations or personal Gmail accounts. Clarify testing-token expiry, verification requirements and the separate Cadence signup policy.
+- Give dropdown carets consistent right padding across the app, with colours that follow light and dark themes. Preserve the booking timezone picker's existing layout and native high-contrast controls.
+
+**Upgrade:** no database or configuration changes required. The Google OAuth guidance applies when you want to connect external calendar accounts; existing connections do not need to change.
+
 ## 0.6.4 — 2026-11-24
 
 - Deploy at root or any URL-safe subpath using `BASE_URL`, without source patches. Forms, redirects, cookies, OAuth callbacks and bundled assets follow the configured path.

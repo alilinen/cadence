@@ -197,22 +197,38 @@ ${pre(`npm run migrate:remote\nnpm run deploy`)}
 <ol>
   <li>In <a href="https://console.cloud.google.com/">Google Cloud Console</a>,
     create a project and enable the Google Calendar API.</li>
-  <li>Configure the OAuth consent screen. While it is unverified you can add
-    up to 100 test users, which is plenty for a team.</li>
+  <li>In <strong>Google Auth Platform &rarr; Audience</strong>, choose
+    <strong>External</strong> and set the publishing status to <strong>In production</strong>
+    if you want to connect calendars from other Google Workspace organisations or personal Gmail accounts.
+    <strong>Internal</strong> only permits accounts in the project's organisation, including
+    when an existing Cadence user chooses <em>Connect another calendar</em>.</li>
+  <li>Complete <strong>Branding</strong> with the app name, support email, homepage,
+    privacy policy, terms and authorised domain. Missing fields can prevent publishing.
+    Cadence supplies <code>/privacy</code> and <code>/terms</code> beneath your
+    <code>BASE_URL</code>; review them for your installation before using them.</li>
   <li>Create an OAuth client ID of type <em>Web application</em> with both
     redirect URIs below registered &mdash; sign-in and calendar connect are
     deliberately separate flows, so a leaked code for one can never be
     exchanged against the other's endpoint:</li>
 </ol>
 ${pre(`https://<your-worker-url>/auth/google/callback?purpose=identity\nhttps://<your-worker-url>/auth/google/callback?purpose=calendar`)}
-<ol start="4">
+<p>Replace <code>https://&lt;your-worker-url&gt;</code> with your full <code>BASE_URL</code>, including any mount path.</p>
+<ol start="5">
   <li>Set the credentials.</li>
 </ol>
 ${pre(`npx wrangler secret put GOOGLE_CLIENT_ID\nnpx wrangler secret put GOOGLE_CLIENT_SECRET`)}
-<p class="pu-muted">Calendar scopes are classed as sensitive by Google.
-  Verification takes weeks, so start it early if you plan to go past 100
-  users; until then the consent screen shows an "unverified app" warning,
-  which is fine for an internal team.</p>
+<p>Use <strong>External + Testing</strong> for development with explicitly listed test users.
+  Calendar refresh tokens in Testing normally expire after <strong>seven days</strong>.
+  Use In production for ongoing connections, and reconnect accounts whose testing credentials have expired.</p>
+<p><strong>In production does not mean verified.</strong> Calendar scopes are sensitive.
+  Unverified external apps can still show Google's warning and are subject to a user cap.
+  Complete Google's verification requirements before offering the app broadly; Workspace
+  administrators can also restrict access. See
+  <a href="https://developers.google.com/identity/protocols/oauth2/production-readiness/overview">Google's OAuth production guidance</a>.</p>
+<p>Keep your intended Cadence allowlist in <strong>Admin &rarr; Signups</strong> or <code>SIGNUPS</code>.
+  Google's audience settings do not open Cadence signups. Existing users can connect external
+  calendars without creating new Cadence users. For conflict checks only, select the calendars
+  to check and set <strong>Write bookings to: Do not write events</strong>.</p>
 
 <h3>Microsoft</h3>
 <ol>
@@ -358,9 +374,14 @@ ${pre(`npx wrangler d1 execute DB --remote --command "INSERT INTO instance_setti
   calendar content.</p>
 
 <h2>Troubleshooting</h2>
-<p><strong>"unverified app" on Google sign-in.</strong> Expected until
-  Google finishes verification. Add yourself as a test user on the consent
-  screen.</p>
+<p><strong>Google says the app can only be used within its organisation.</strong>
+  Set Google Auth Platform &rarr; Audience to <strong>External</strong> for accounts outside
+  that organisation, and use <strong>In production</strong> for ongoing calendar connections.
+  Changing Cadence's signup allowlist does not fix this Google restriction.</p>
+<p><strong>"unverified app" on Google sign-in.</strong> Publishing to production does not
+  complete Google's verification. Review Google's verification requirements for your app.
+  Add test users only when the publishing status is Testing; this does not remove the
+  testing refresh-token lifetime.</p>
 <p><strong>Emails are not arriving.</strong> With no
   <code>RESEND_API_KEY</code> they are logged, not sent. Check
   <code>npx wrangler tail</code>. If you bound Cloudflare Email Service
